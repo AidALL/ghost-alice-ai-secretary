@@ -34,7 +34,7 @@ OPENCLAW_VERSION = "2026.9.8"
 OPENCLAW_INTEGRITY = "sha512-G+JkNUhtpDE3cXR4AEi2NyyG9fqI/T2WUSl8ZnR8AATH8Dh1kC3qYFL7wwPoZtgHiP/cszA86PEiE0PDysxb9Q=="
 NODE_VERSION = "24.21.0"
 SCHEMA_VERSION = 2
-SOURCE_PARTS = ("src", "native", "scripts/build_native.sh", "scripts/installer.py", "openclaw-plugin", "addons", "addons-manifest.json", "pyproject.toml", "README.md", "LICENSE", "NOTICE", "ARCHITECTURE.md", "THIRD_PARTY_NOTICES.md")
+SOURCE_PARTS = ("src", "native", "scripts/build_native.sh", "scripts/installer.py", "openclaw-plugin", "addons", "addons-manifest.json", "pyproject.toml", "README.md", "README_ko.md", "LICENSE", "NOTICE", "ARCHITECTURE.md", "THIRD_PARTY_NOTICES.md")
 REGISTRY_PLATFORMS = ("codex", "claude")
 IGNORED = {"__pycache__", ".DS_Store", ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 _FRAMEWORK_PUBLISH_LOCK = threading.RLock()

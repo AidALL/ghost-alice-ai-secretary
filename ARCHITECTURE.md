@@ -1,5 +1,7 @@
 # Architecture
 
+Operator guide: [English](./README.md) | [Korean](./README_ko.md). Both guides cover installation, model configuration, first use, stopping, approval and recovery on one page.
+
 AI Secretary is an independent Ghost-ALICE addon for broad local desktop work. Its core owns actual user admission, conversation identity, outgoing draft approval and desktop effect records. The bundled OpenClaw adapter supplies an inference host; replacing that adapter does not move these responsibilities out of the core.
 
 ```mermaid
@@ -55,9 +57,17 @@ The outgoing button label check is an assistive heuristic. It does not recognize
 
 ## Model and process boundaries
 
-`resources/model-policy.json` currently accepts the declared Ollama provider route. The bundled configuration defaults to a loopback Ollama endpoint and permits Secretary tools. A provider name does not attest that the actual model server is on premises. Raw MCP transport also cannot verify an upstream host's model or network location; endpoint configuration and network isolation require separate checks.
+`src/ai_secretary/resources/model-policy.json` currently accepts the declared Ollama provider route. The initial template defaults to `http://127.0.0.1:11434` and `qwen3-vl:8b`, and permits Secretary tools. The addon installs neither the model server nor model weights. GUI execution requires actual vision and tool-calling capability in the selected model; an authored `input: ["text", "image"]` declaration cannot supply missing capability.
 
-Interrupting the local OpenClaw client terminates and reaps that client, including repeated Ctrl-C cleanup and cancellation from a worker-thread event loop. This does not prove the Gateway run stopped. Use Gateway stop controls and reconcile pending effects before retrying.
+Installed launchers select the mutable `<prefix>/state/openclaw.json`, defaulting to `~/.local/share/ai-secretary/state/openclaw.json`, and use `<prefix>/state/openclaw/` for OpenClaw state. The managed `config/openclaw.json` is an initialization template. Reinstall preserves an existing state configuration. Endpoint/model changes must keep `models.providers.ollama.baseUrl`, `models.providers.ollama.models[0].id` and `agents.defaults.model.primary` consistent; the primary is `ollama/<model-id>`. The paired operator guides use the pinned CLI's JSON batch to update these together.
+
+A provider name does not attest that the actual model server is on premises. Raw MCP transport also cannot verify an upstream host's model or network location; actual endpoint configuration, model execution location and network isolation require separate checks. Personal messages, attachments and screens must not be forwarded through external models, fallbacks, channels or telemetry paths.
+
+Installer `status` establishes ownership, drift and registration, while reporting model and accessibility as `not-checked`; its lock can also recover an interrupted install. `ai-secretary doctor` queries native Accessibility and Screen Recording flags. Its `model_endpoint` text is a hardcoded localhost hint, not an active-config read or connection probe. Schema validation, native permissions, endpoint/model availability, real inference and the actual selected app/file result are distinct evidence. Installation, Gateway startup, protocol stubs and test-window success do not close the latter stages.
+
+Interrupting the local OpenClaw client terminates and reaps that client, including repeated Ctrl-C cleanup and cancellation from a worker-thread event loop. This does not prove the Gateway run stopped. For the foreground `openclaw gateway run --bind loopback` used in the guide, Ctrl-C in the Gateway's own terminal stops that process. Wait for it to exit, then inspect the actual app/file or outgoing effect before retrying. Automatic `Unknown` reconciliation is not implemented; preserve uncertain records until an evidence-backed resolution is available.
+
+Ghost-ALICE's current input gate governs Secretary admission and tools. Autopilot's approved run and continuation hooks are a separate lifecycle; Secretary installation does not enroll or approve an Autopilot run.
 
 ## Installation and release boundaries
 

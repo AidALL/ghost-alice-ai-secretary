@@ -26,6 +26,7 @@ class InstallerTests(unittest.TestCase):
         skill = self.source / "addons/ai-secretary/skill"
         skill.mkdir(parents=True)
         (self.source / "README.md").write_text("Fixture installation guide.\n")
+        (self.source / "README_ko.md").write_text("Fixture installation guide in Korean.\n")
         for name in ("LICENSE", "NOTICE", "ARCHITECTURE.md", "THIRD_PARTY_NOTICES.md"):
             (self.source / name).write_bytes((ROOT / name).read_bytes())
         (self.source / "pyproject.toml").write_text('[project]\nname = "ai-secretary-fixture"\nversion = "0.1.0"\n')
@@ -95,6 +96,33 @@ class InstallerTests(unittest.TestCase):
                 self.assertTrue(installed.is_file(), f"installed public package lacks {name}")
                 self.assertEqual(installed.read_bytes(), (self.source / name).read_bytes())
                 self.assertIn("app/" + name, entries)
+
+    def test_paired_readmes_are_shipped_with_owned_runtime(self):
+        self.subject.install()
+        entries = self.subject._manifest()["resources"][0]["entries"]
+        for name in ("README.md", "README_ko.md"):
+            with self.subTest(document=name):
+                installed = self.prefix / "managed/app" / name
+                self.assertTrue(installed.is_file(), f"installed public package lacks {name}")
+                self.assertEqual(installed.read_bytes(), (self.source / name).read_bytes())
+                self.assertIn("app/" + name, entries)
+
+    def test_korean_readme_source_change_refreshes_owned_package_and_preserves_state(self):
+        self.subject.install()
+        state_marker = self.prefix / "state/secretary/user-work.txt"
+        state_marker.write_text("preserve this user state\n")
+        configuration = self.prefix / "state/openclaw.json"
+        config = json.loads(configuration.read_text())
+        config["user-customization"] = "preserve"
+        configuration.write_text(json.dumps(config))
+
+        source_guide = self.source / "README_ko.md"
+        source_guide.write_bytes(source_guide.read_bytes() + b"Updated fixture content.\n")
+
+        self.assertEqual(self.subject.install()["status"], "installed")
+        self.assertEqual((self.prefix / "managed/app/README_ko.md").read_bytes(), source_guide.read_bytes())
+        self.assertEqual(state_marker.read_text(), "preserve this user state\n")
+        self.assertEqual(json.loads(configuration.read_text())["user-customization"], "preserve")
 
     def test_notice_source_change_refreshes_the_owned_public_package(self):
         self.subject.install()
