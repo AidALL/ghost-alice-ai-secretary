@@ -8,8 +8,10 @@ Current addon source version: `0.1.0`. Public source: [AidALL/ghost-alice-ai-sec
 
 ## Contents
 
+- [System at a glance](#system-at-a-glance)
 - [Requirements](#requirements)
 - [Install the complete addon](#install-the-complete-addon)
+- [What to review before first use](#what-to-review-before-first-use)
 - [Check first-use readiness](#check-first-use-readiness)
 - [Configure the on-prem model](#configure-the-on-prem-model)
 - [Check the endpoint and real inference](#check-the-endpoint-and-real-inference)
@@ -20,6 +22,29 @@ Current addon source version: `0.1.0`. Public source: [AidALL/ghost-alice-ai-sec
 - [Custom paths, reinstall and removal](#custom-paths-reinstall-and-removal)
 - [Privacy and current limits](#privacy-and-current-limits)
 - [Development validation](#development-validation)
+
+## System at a glance
+
+```mermaid
+flowchart LR
+    User["User / sender"] --> Control["Secretary control<br/>request · session · approval"]
+    Control -->|"admit / check"| Ghost["Ghost-ALICE<br/>current input gate"]
+    Control -->|"immutable RunRequest"| Host["OpenClaw adapter<br/>agent / Gateway"]
+    Host --> Model["On-prem model<br/>vision / tools"]
+    Host --> Plugin["OpenClaw plugin<br/>worker bridge"]
+    Plugin --> Executor["Secretary executor"]
+    Control --> Direct["Direct invoke / MCP<br/>user task admitted"]
+    Direct --> Executor
+    Control -->|"stored-draft approval"| Ledger["Secretary ledger<br/>tasks / drafts / grants<br/>effects / desktop lease"]
+    Executor -->|"current gate"| Ghost
+    Executor -->|"validate / record"| Ledger
+    Executor --> Native["macOS driver<br/>observe / guard input"]
+    Native --> Desktop["Desktop apps and files"]
+    Executor -->|"directory listing"| Desktop
+    User -.->|"separate approved run"| Autopilot["Optional Autopilot<br/>continuation lifecycle"]
+```
+
+Arrows show request, tool and approval calls; the executor calls the native driver and uses the ledger for authority and records. OpenClaw is the shipped inference route. Direct invocation and MCP reach the same executor without using that adapter; their upstream model/network still needs review. File listing runs in Python. Autopilot is optional and separately approved; Secretary installation does not activate it. See [Architecture](./ARCHITECTURE.md) for component dependencies and action/retry flow.
 
 ## Requirements
 
@@ -47,6 +72,18 @@ The installer provisions the skill, Secretary program, native helper, OpenClaw `
 The official Core `ai-secretary` alias is being prepared in [Core integration PR #47](https://github.com/AidALL/ghost-alice/pull/47), pending merge and delivery. Use this addon's installer until that integration is available in your installed Core. The existing generic Core `--addon-source` path installs skill content and does not provision this complete runtime.
 
 The installer checks the top-level OpenClaw version and npm integrity, and the Node version and distribution archive checksum. Network installation still resolves npm transitive dependencies at install time; this is not a reproducible lock of the entire dependency set. `--openclaw-source` and `--node-source` reuse verifiable pinned caches for development validation.
+
+## What to review before first use
+
+| Review area | What to decide or verify |
+| --- | --- |
+| Operator decision: model and network | Read back the active on-prem URL and exact model ID. Verify actual vision, tool calling and network isolation, including upstream MCP hosts, fallbacks, channels and telemetry. A provider label or configuration declaration is insufficient. |
+| Operator decision: first task | Name the app/window, selected attachment or file, absolute destination and observable success condition. Inspect the actual saved file or app result; installation, permissions and protocol checks establish different stages. |
+| Sender decision: exact outgoing approval | Review the stored account, recipients, body, attachment hashes and invitation details before approving the exact digest. General desktop permission does not authorize sending. |
+| Implementation gap: app meaning | Compare the actual composer with the approved draft and observe the final effect. The outgoing-label heuristic cannot prove every opaque app's meaning or composer/draft equivalence. |
+| Implementation gap: recovery | Identify the Gateway stop control; stopping the local client does not prove Gateway work stopped. Inspect the effect before retrying. `Applying` or `Unknown` requires evidence-backed reconciliation, which is not automated. |
+| Distribution gap: Core alias | The official alias is pending in [PR #47](https://github.com/AidALL/ghost-alice/pull/47). Use this addon's complete installer until that integration is delivered in your Core. Secretary installation does not approve optional Autopilot work. |
+| Per-app validation | Keep evidence specific to the tested app and workflow. One bounded success does not establish KakaoTalk, WeChat or another app's attachment, composer or send behavior. |
 
 ## Check first-use readiness
 
@@ -190,7 +227,7 @@ When continuing a conversation with a native session ID, pass `sessionKey::sessi
 
 For the foreground Gateway started above, press Ctrl-C in its own terminal and wait for the process to exit. Ctrl-C in the `ai-secretary run` terminal cleans up the local client; it does not establish that Gateway work stopped. If you interrupted the client while work might still be running, stop the foreground Gateway too.
 
-Before retrying, inspect the actual business effect: did the file save, did the composer change, or did a message send? Reobserve the relevant app and check the destination file or sent-message result. A completed matching OperationId reuses its recorded result; a different effect cannot reuse that ID. Uncertain effects are recorded as `Unknown` and require reconciliation before another attempt. OS input completion alone does not prove a saved file or sent message. Automatic `Unknown` reconciliation is not implemented. Preserve the state and obtain an evidence-backed resolution for an uncertain effect before reissuing it.
+Before retrying, inspect the actual business effect: did the file save, did the composer change, or did a message send? Reobserve the relevant app and check the destination file or sent-message result. A completed matching OperationId reuses its recorded result; a different effect cannot reuse that ID. An uncertain result becomes `Unknown` when the worker can persist it; a hard interruption can leave `Applying`. Both require reconciliation before another attempt. OS input completion alone does not prove a saved file or sent message. Automatic reconciliation is not implemented. Preserve the state and obtain an evidence-backed resolution for an uncertain effect before reissuing it.
 
 ## Approve outgoing work
 
