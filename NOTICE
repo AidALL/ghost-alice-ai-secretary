@@ -1,0 +1,7 @@
+AI Secretary
+Copyright 2026 AidALL Inc.
+
+This project is licensed under the Apache License, Version 2.0.
+Ghost-ALICE is an external governance and installation dependency.
+OpenClaw is installed separately as a pinned, replaceable execution runtime;
+its source and dependency tree are not vendored in this repository.

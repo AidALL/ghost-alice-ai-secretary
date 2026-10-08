@@ -1,0 +1,11 @@
+{
+  "addon_id": "ai-secretary",
+  "addon_version": "0.1.0",
+  "license": "Apache-2.0",
+  "distribution": "first-party",
+  "repository": "https://github.com/AidALL/ghost-alice-ai-secretary",
+  "installer": "../../scripts/installer.py",
+  "platforms": ["codex", "claude"],
+  "depends_on_core": [],
+  "skills": [{"name": "ai-secretary", "source": "skill", "skill_dir": "ai-secretary"}]
+}

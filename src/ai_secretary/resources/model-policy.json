@@ -1,0 +1,6 @@
+{
+  "default_provider": "ollama",
+  "on_prem_providers": ["ollama"],
+  "scope": "declared_provider_route",
+  "transport_verifies_model_location": false
+}

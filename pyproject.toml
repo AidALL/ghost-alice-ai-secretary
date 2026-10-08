@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-secretary"
+version = "0.1.0"
+description = "On-prem desktop secretary governed by Ghost-ALICE"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/AidALL/ghost-alice-ai-secretary"
+Issues = "https://github.com/AidALL/ghost-alice-ai-secretary/issues"
+
+[project.scripts]
+ai-secretary = "ai_secretary.control:main"
+ai-secretary-worker = "ai_secretary.service:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ai_secretary = ["resources/*.json", "resources/*.mjs"]

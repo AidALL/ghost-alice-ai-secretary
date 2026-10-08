@@ -1,0 +1,182 @@
+[
+  {
+    "name": "secretary_status",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "secretary_apps",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "secretary_windows",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "integer"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "secretary_observe",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "integer"
+        },
+        "window_id": {
+          "type": "integer"
+        },
+        "include_ax": {
+          "type": "boolean"
+        },
+        "screenshot_base64": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "pid"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "secretary_files",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "secretary_draft",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "draft_id": {
+          "type": "string"
+        },
+        "content": {
+          "type": "object",
+          "description": "Actual sender account, recipients, body, attachment content hashes and invite details; shown to the user for approval."
+        }
+      },
+      "required": [
+        "draft_id",
+        "content"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "secretary_act",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "operation_id": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "focus",
+            "click",
+            "drag",
+            "scroll",
+            "type",
+            "hotkey",
+            "open"
+          ]
+        },
+        "expected": {
+          "type": "object"
+        },
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "button": {
+          "type": "string"
+        },
+        "count": {
+          "type": "integer"
+        },
+        "from_x": {
+          "type": "number"
+        },
+        "from_y": {
+          "type": "number"
+        },
+        "to_x": {
+          "type": "number"
+        },
+        "to_y": {
+          "type": "number"
+        },
+        "duration": {
+          "type": "number"
+        },
+        "delta_x": {
+          "type": "integer"
+        },
+        "delta_y": {
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "modifiers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "path": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        },
+        "target_label": {
+          "type": "string"
+        },
+        "outbound": {
+          "type": "object",
+          "description": "Exact user-approved draft_id and content, required at outgoing commit."
+        }
+      },
+      "required": [
+        "operation_id",
+        "action",
+        "expected"
+      ],
+      "additionalProperties": false
+    }
+  }
+]
