@@ -27,7 +27,16 @@ final class Fixture: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         download.frame = NSRect(x: 24, y: 100, width: 220, height: 34)
         download.setAccessibilityIdentifier("fixture-download")
         content.addSubview(download)
+        for (identifier, text, y) in [("fixture-account", "fixture-account", 112.0),
+                                      ("fixture-conversation", "fixture-conversation", 85.0),
+                                      ("fixture-item", "Attachment: fixture-download.txt", 140.0)] {
+            let evidence = NSTextField(labelWithString: text)
+            evidence.setAccessibilityIdentifier(identifier)
+            evidence.frame = NSRect(x: identifier == "fixture-item" ? 24 : 280, y: y, width: 310, height: 20)
+            content.addSubview(evidence)
+        }
         status = NSTextField(labelWithString: "No download yet")
+        status.setAccessibilityIdentifier("fixture-status")
         status.frame = NSRect(x: 24, y: 35, width: 570, height: 40)
         content.addSubview(status)
         window.center()

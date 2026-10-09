@@ -1,0 +1,279 @@
+import PeekabooAutomationKitTestSupport
+import Testing
+@testable import PeekabooAutomationKit
+
+struct SnapshotTargetReceiptPlannerTests {
+    @Test
+    func `process scoped context keeps generation and discards unreceipted window hints`() throws {
+        let context = WindowContext(
+            applicationProcessId: 42,
+            applicationProcessStartIdentity: 1001,
+            windowTitle: "AX-only description",
+            windowID: 73,
+            windowBounds: .init(x: 20, y: 30, width: 640, height: 480))
+
+        let evidence = DesktopTargetEvidenceAdapter.evidence(context: context)
+        let resolved = try DesktopTargetPlanning.DesktopTargetIdentityCoalescer.resolve([evidence])
+        let identity = try #require(resolved)
+
+        #expect(identity.processIdentity == .init(processIdentifier: 42, processStartIdentity: 1001))
+        #expect(identity.exactWindow == nil)
+        #expect(evidence.windowID == nil)
+        #expect(evidence.windowBounds == nil)
+    }
+
+    @Test
+    func `evidence adapters preserve linked process and exact-window identity`() {
+        let focusedElement = AutomationTestFixtures.focusedElement()
+        let fixture = AutomationTestFixtures.linkedSnapshotTarget(focusedElement: focusedElement)
+        let snapshotEvidence = DesktopTargetEvidenceAdapter.evidence(snapshot: fixture.automationSnapshot)
+        let contextEvidence = DesktopTargetEvidenceAdapter.evidence(context: fixture.desktopTarget.windowContext)
+        let rawEvidence = DesktopTargetEvidenceAdapter.evidence(
+            processIdentifier: fixture.desktopTarget.processIdentity.processIdentifier,
+            processStartIdentity: fixture.desktopTarget.processIdentity.processStartIdentity,
+            windowID: fixture.desktopTarget.windowIdentity.windowID,
+            windowIdentity: fixture.desktopTarget.windowIdentity,
+            windowBounds: fixture.desktopTarget.window.bounds,
+            focusedElement: focusedElement)
+        let applicationEvidence = DesktopTargetEvidenceAdapter.evidence(
+            application: fixture.desktopTarget.application)
+        let windowEvidence = DesktopTargetEvidenceAdapter.evidence(window: fixture.desktopTarget.window)
+
+        #expect(snapshotEvidence == contextEvidence)
+        #expect(snapshotEvidence == rawEvidence)
+        #expect(snapshotEvidence.focusedElement == focusedElement)
+        for evidence in [snapshotEvidence, contextEvidence, rawEvidence, windowEvidence] {
+            #expect(evidence.processIdentifier == fixture.desktopTarget.processIdentity.processIdentifier)
+            #expect(evidence.processIdentity == fixture.desktopTarget.processIdentity)
+            #expect(evidence.windowID == fixture.desktopTarget.windowIdentity.windowID)
+            #expect(evidence.windowIdentity == fixture.desktopTarget.windowIdentity)
+            #expect(evidence.windowBounds == fixture.desktopTarget.window.bounds)
+        }
+        #expect(applicationEvidence.processIdentifier == fixture.desktopTarget.processIdentity.processIdentifier)
+        #expect(applicationEvidence.processIdentity == fixture.desktopTarget.processIdentity)
+        #expect(applicationEvidence.windowID == nil)
+    }
+
+    @Test
+    func `window target evidence preserves exact receipts and selector-only identifiers`() {
+        let fixture = AutomationTestFixtures.linkedSnapshotTarget()
+        let identity = fixture.desktopTarget.windowIdentity
+
+        let exact = DesktopTargetEvidenceAdapter.evidence(
+            windowTarget: .windowId(identity.windowID),
+            windowIdentity: identity)
+        let selectorOnly = DesktopTargetEvidenceAdapter.evidence(
+            windowTarget: .title("Editor"),
+            windowIdentity: nil)
+        let identifierOnly = DesktopTargetEvidenceAdapter.evidence(
+            windowTarget: .windowId(identity.windowID),
+            windowIdentity: nil)
+
+        #expect(exact.processIdentifier == identity.ownerProcessIdentifier)
+        #expect(exact.processIdentity == identity.processIdentity)
+        #expect(exact.windowID == identity.windowID)
+        #expect(exact.windowIdentity == identity)
+        #expect(exact.windowBounds == identity.capturedBounds)
+        #expect(selectorOnly == .init())
+        #expect(identifierOnly == .init(windowID: identity.windowID))
+    }
+
+    @Test
+    func `selector context evidence retains constraints without changing stable context policy`() {
+        let context = WindowContext(
+            applicationProcessId: 42,
+            applicationProcessStartIdentity: 1001,
+            windowID: 73,
+            windowBounds: .init(x: 20, y: 30, width: 640, height: 480))
+
+        let selectorEvidence = DesktopTargetEvidenceAdapter.evidence(selectorContext: context)
+        let stableEvidence = DesktopTargetEvidenceAdapter.evidence(context: context)
+
+        #expect(selectorEvidence.processIdentifier == 42)
+        #expect(selectorEvidence.processIdentity == nil)
+        #expect(selectorEvidence.windowID == 73)
+        #expect(selectorEvidence.windowBounds == context.windowBounds)
+        #expect(stableEvidence.processIdentity == .init(processIdentifier: 42, processStartIdentity: 1001))
+        #expect(stableEvidence.windowID == nil)
+        #expect(stableEvidence.windowBounds == nil)
+    }
+
+    @Test
+    func `planner merges linked sources and preserves coordinate authority`() throws {
+        let focusedElement = AutomationTestFixtures.focusedElement()
+        let fixture = AutomationTestFixtures.linkedSnapshotTarget(focusedElement: focusedElement)
+
+        let plan = try fixture.receiptPlan
+        let identity = try plan.receipt.requireIdentity()
+        let authority = try plan.receipt.requireCoordinateAuthority()
+
+        #expect(plan.sourceEvidence.count == 2)
+        #expect(plan.hasProcessIdentifierEvidence)
+        #expect(identity.exactWindow?.identity == fixture.desktopTarget.windowIdentity)
+        #expect(identity.exactWindow?.focusedElement == focusedElement)
+        #expect(plan.receipt.applicationBundleIdentifier == fixture.desktopTarget.application.bundleIdentifier)
+        #expect(plan.receipt.applicationName == fixture.desktopTarget.application.name)
+        #expect(authority.snapshotID == fixture.snapshotID)
+        #expect(authority.target.identity == fixture.desktopTarget.windowIdentity)
+        #expect(authority.target.bounds == fixture.desktopTarget.window.bounds)
+        #expect(authority.target.focusedElement == nil)
+        #expect(authority.sourceBounds == fixture.desktopTarget.window.bounds)
+        #expect(authority.context == fixture.coordinateContext)
+    }
+
+    @Test
+    func `planner fails closed when snapshot sources identify different process generations`() {
+        let snapshotFixture = AutomationTestFixtures.linkedSnapshotTarget()
+        let detectionFixture = AutomationTestFixtures.linkedSnapshotTarget(
+            processIdentity: AutomationTestFixtures.processIdentity(
+                processIdentifier: snapshotFixture.desktopTarget.processIdentity.processIdentifier,
+                processStartIdentity: snapshotFixture.desktopTarget.processIdentity.processStartIdentity + 1))
+
+        #expect(throws: DesktopTargetIdentityError.contradictoryProcessGeneration) {
+            _ = try SnapshotTargetReceiptPlanner.assemble(
+                snapshotID: snapshotFixture.snapshotID,
+                automationSnapshot: snapshotFixture.automationSnapshot,
+                detectionResult: detectionFixture.detectionResult)
+        }
+    }
+
+    @Test
+    func `planner rejects detection evidence from another snapshot`() {
+        let fixture = AutomationTestFixtures.linkedSnapshotTarget(snapshotID: "snapshot-1")
+
+        #expect(throws: DesktopTargetIdentityError.snapshotSourceMismatch) {
+            _ = try SnapshotTargetReceiptPlanner.assemble(
+                snapshotID: "snapshot-2",
+                detectionResult: fixture.detectionResult)
+        }
+    }
+
+    @Test
+    func `best-effort loading omits an unavailable source without weakening the receipt`() async throws {
+        let fixture = AutomationTestFixtures.linkedSnapshotTarget()
+        let planner = SnapshotTargetReceiptPlanner(
+            automationSnapshotProvider: { _ in throw SnapshotPlannerTestError.unavailable },
+            detectionResultProvider: { _ in fixture.detectionResult },
+            sourceFailurePolicy: .omitUnavailableSources)
+
+        let plan = try await planner.plan(snapshotID: fixture.snapshotID)
+
+        #expect(plan.sourceEvidence.count == 1)
+        #expect(try plan.receipt.requireIdentity().exactWindow?.identity == fixture.desktopTarget.windowIdentity)
+        #expect(try plan.receipt.requireCoordinateAuthority().context == fixture.coordinateContext)
+    }
+
+    @Test
+    func `process identity planning defers incomplete exact-window evidence to mutation planning`() async throws {
+        let fixture = AutomationTestFixtures.linkedSnapshotTarget()
+        let incompleteIdentity = WindowMutationIdentity(
+            windowID: fixture.desktopTarget.windowIdentity.windowID,
+            ownerProcessIdentifier: fixture.desktopTarget.processIdentity.processIdentifier,
+            ownerProcessStartIdentity: fixture.desktopTarget.processIdentity.processStartIdentity)
+        let detection = AutomationTestFixtures.detectionResult(
+            snapshotID: fixture.snapshotID,
+            windowContext: WindowContext(
+                applicationProcessId: fixture.desktopTarget.processIdentity.processIdentifier,
+                windowID: incompleteIdentity.windowID,
+                windowBounds: fixture.desktopTarget.window.bounds,
+                windowMutationIdentity: incompleteIdentity))
+        let planner = SnapshotTargetReceiptPlanner(
+            automationSnapshotProvider: { _ in nil },
+            detectionResultProvider: { _ in detection })
+
+        await #expect(throws: DesktopTargetIdentityError.incompleteExactWindow) {
+            _ = try await planner.plan(snapshotID: fixture.snapshotID)
+        }
+        await #expect(throws: SnapshotTargetReceiptPreDispatchError(.incompleteExactWindow).actionFailure) {
+            _ = try await planner.planForMutation(snapshotID: fixture.snapshotID)
+        }
+        let processPlan = try await planner.planProcessIdentity(snapshotID: fixture.snapshotID)
+        let identity = try processPlan.receipt.requireIdentity()
+        #expect(identity.processIdentity == fixture.desktopTarget.processIdentity)
+        #expect(identity.exactWindow == nil)
+    }
+
+    @Test
+    func `mutation planning preserves complete receipts and other validation errors`() async throws {
+        let fixture = AutomationTestFixtures.linkedSnapshotTarget()
+        let planner = SnapshotTargetReceiptPlanner(
+            automationSnapshotProvider: { _ in fixture.automationSnapshot },
+            detectionResultProvider: { _ in fixture.detectionResult })
+        #expect(try await planner.planForMutation(snapshotID: fixture.snapshotID) == fixture.receiptPlan)
+        await #expect(throws: DesktopTargetIdentityError.snapshotSourceMismatch) {
+            _ = try await planner.planForMutation(snapshotID: "another-snapshot")
+        }
+
+        let missingGeneration = SnapshotTargetReceiptPlanner(
+            automationSnapshotProvider: { _ in nil },
+            detectionResultProvider: { _ in
+                AutomationTestFixtures.detectionResult(
+                    snapshotID: fixture.snapshotID,
+                    windowContext: WindowContext(applicationProcessId: 42))
+            })
+        await #expect(throws: DesktopTargetIdentityError.missingProcessGeneration) {
+            _ = try await missingGeneration.planForMutation(snapshotID: fixture.snapshotID)
+        }
+        let unavailableSource = SnapshotTargetReceiptPlanner(
+            automationSnapshotProvider: { _ in throw SnapshotPlannerTestError.unavailable },
+            detectionResultProvider: { _ in nil })
+        await #expect(throws: SnapshotPlannerTestError.unavailable) {
+            _ = try await unavailableSource.planForMutation(snapshotID: fixture.snapshotID)
+        }
+    }
+
+    @Test
+    func `best-effort loading still propagates cancellation`() async {
+        let snapshotCancellation = SnapshotTargetReceiptPlanner(
+            automationSnapshotProvider: { _ in throw CancellationError() },
+            detectionResultProvider: { _ in nil },
+            sourceFailurePolicy: .omitUnavailableSources)
+        let detectionCancellation = SnapshotTargetReceiptPlanner(
+            automationSnapshotProvider: { _ in nil },
+            detectionResultProvider: { _ in throw CancellationError() },
+            sourceFailurePolicy: .omitUnavailableSources)
+
+        await #expect(throws: CancellationError.self) {
+            _ = try await snapshotCancellation.plan(snapshotID: "snapshot-1")
+        }
+        await #expect(throws: CancellationError.self) {
+            _ = try await detectionCancellation.plan(snapshotID: "snapshot-1")
+        }
+        await #expect(throws: CancellationError.self) {
+            _ = try await snapshotCancellation.planForMutation(snapshotID: "snapshot-1")
+        }
+        await #expect(throws: CancellationError.self) {
+            _ = try await detectionCancellation.planForMutation(snapshotID: "snapshot-1")
+        }
+    }
+
+    @Test
+    func `planner observes cancellation even when a source returns normally`() async {
+        let fixture = AutomationTestFixtures.linkedSnapshotTarget()
+        let sourceStarted = AsyncTestLatch()
+        let sourceRelease = AsyncTestLatch()
+        let planner = SnapshotTargetReceiptPlanner(
+            automationSnapshotProvider: { _ in
+                await sourceStarted.open()
+                await sourceRelease.wait()
+                return fixture.automationSnapshot
+            },
+            detectionResultProvider: { _ in fixture.detectionResult },
+            sourceFailurePolicy: .omitUnavailableSources)
+        let task = Task {
+            try await planner.plan(snapshotID: fixture.snapshotID)
+        }
+
+        #expect(await sourceStarted.opensWithin(.seconds(1)))
+        task.cancel()
+        await sourceRelease.open()
+
+        await #expect(throws: CancellationError.self) {
+            _ = try await task.value
+        }
+    }
+}
+
+private enum SnapshotPlannerTestError: Error {
+    case unavailable
+}

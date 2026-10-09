@@ -1,16 +1,29 @@
 # Third-party notices
 
-The AI Secretary source is licensed under Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). Ghost-ALICE is maintained in the separate [AidALL/ghost-alice](https://github.com/AidALL/ghost-alice) repository under Apache-2.0. AI Secretary uses its installed governance and installer interfaces rather than including a private Ghost-ALICE checkout in this source release.
+AI Secretary source is licensed under Apache-2.0; see [LICENSE](./LICENSE) and [NOTICE](./NOTICE). Ghost-ALICE is maintained separately in [AidALL/ghost-alice](https://github.com/AidALL/ghost-alice) under Apache-2.0. Secretary uses its installed governance/installer interfaces rather than publishing a private Core checkout.
 
 ## Runtime packages provisioned by the installer
 
-| Package | Pinned version | License and notices |
+| Package | Pinned version | License and retained notices |
 | --- | --- | --- |
-| OpenClaw | `2026.9.8` | [MIT license](https://github.com/openclaw/openclaw/blob/v2026.9.8/LICENSE), copyright OpenClaw Foundation. Its upstream `THIRD_PARTY_NOTICES.md` covers incorporated/adapted code and remains part of the installed package. |
-| Node.js | `24.21.0` | [Node.js license file](https://github.com/nodejs/node/blob/v24.21.0/LICENSE), including bundled third-party license texts. The private Node distribution retains its license files. |
+| OpenClaw | `2026.9.8` | [MIT license](https://github.com/openclaw/openclaw/blob/v2026.9.8/LICENSE), OpenClaw Foundation. The installed package retains upstream third-party notices and dependency licenses. |
+| Node.js | `24.21.0` | [Node.js license](https://github.com/nodejs/node/blob/v24.21.0/LICENSE), including bundled third-party texts retained in the private distribution. |
 
-The repository does not publish local `node_modules`, runtime caches, compiled desktop binaries or installed model weights. The complete installer obtains the runtime packages separately and preserves the license and notice files contained in those packages. npm dependencies retain their own licenses; the top-level OpenClaw license does not replace them.
+The source repository excludes runtime caches, local `node_modules`, compiled desktop binaries and model weights. The installer provisions runtime packages separately, checks the exact OpenClaw version/npm integrity and the Node version/archive checksum, and preserves included licenses. npm transitive dependencies are resolved at installation time; these top-level pins do not constitute a reproducible whole-runtime dependency lock.
 
-The installer checks the exact OpenClaw package version and npm integrity and checks the Node version and downloaded archive checksum. Transitive npm dependencies are resolved at installation time; this release does not include a reproducible transitive dependency lock. A binary redistribution or vendored runtime release would need a license inventory for that exact dependency set in addition to these source-release notices.
+## Selected optional native sources
 
-Python and the Swift/macOS development tools are prerequisites supplied separately by the operator. Ollama and any selected model weights are configured separately and are subject to their respective licenses. No model is downloaded by this source publication.
+Peekaboo `4.6.0` is pinned at `b54551ce2d0013e52c2a405bfeabced88ec5c2e0`, matching the selected OpenClaw source revision `fc23bc864e4553c2d215e479eeec47b67a0bf943`. Secretary links selected `PeekabooAutomationKit`/`PeekabooFoundation` libraries and their required closure, with three disclosed source changes: private coordinator injection in two files and exact-window pointer delivery of the forbidden AX-value flag in one file. The source manifest, patch/hash records, Swift dependency lock and full notices are retained under [native/](./native/THIRD_PARTY_NOTICES.md). The independent builtin backend does not require these optional libraries.
+
+| Selected dependency | License text |
+| --- | --- |
+| Peekaboo | [MIT, Peter Steinberger 2025](./native/Notices/Peekaboo.txt) |
+| AXorcist | [MIT, Peter Steinberger 2025](./native/Notices/AXorcist.txt) |
+| swift-log | [Apache-2.0](./native/Notices/swift-log.txt) |
+| swift-algorithms | [Apache-2.0 with runtime library exception](./native/Notices/swift-algorithms.txt) |
+| swift-numerics | [Apache-2.0 with runtime library exception](./native/Notices/swift-numerics.txt) |
+| Commander | [MIT, Peter Steinberger 2026](./native/Notices/Commander.txt); resolved by SwiftPM, not linked into the selected product |
+
+Optional native installation retains those notices. Source or binary redistribution must preserve the applicable full license texts and disclosed modifications. Any broader runtime/binary redistribution needs a license inventory for its exact dependency set; the top-level upstream license does not replace dependency licenses.
+
+Python and Swift/macOS development tools are supplied separately. Ollama and selected model weights are configured separately and have their own licenses. This source publication downloads no model.

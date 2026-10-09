@@ -2,7 +2,7 @@
 
 언어: [English](./README.md) | Korean
 
-AI Secretary는 KakaoTalk과 WeChat을 포함한 여러 앱에서 로컬 데스크톱 작업을 수행하는 독립 [Ghost-ALICE](https://github.com/AidALL/ghost-alice) 애드온입니다. 비서 코어가 실제 사용자 요청 등록, 정확한 발신 승인, 대화 식별자와 데스크톱 효과 기록을 소유합니다. 교체 가능한 OpenClaw 어댑터가 추론을 실행하고, macOS 네이티브 도구가 창·마우스·키보드·파일을 관찰하고 조작합니다. 앱별 API는 필수 조건이 아닙니다.
+AI Secretary는 KakaoTalk과 WeChat을 포함한 여러 앱에서 로컬 데스크톱 작업을 수행하는 독립 [Ghost-ALICE](https://github.com/AidALL/ghost-alice) 애드온입니다. 비서 코어가 사용자 권한, 정확한 발신 승인, 대화 식별자, 검증된 수집, 타이머 선언과 데스크톱 효과를 소유합니다. 교체 가능한 OpenClaw 어댑터는 추론과 고정 명령 타이머를 제공하며, macOS 네이티브 도구는 독립 builtin 또는 명시적으로 선택한 Peekaboo 백엔드를 사용합니다. 앱별 API는 필수 조건이 아닙니다.
 
 현재 애드온 소스 버전은 `0.1.0`이며, 공개 소스는 [AidALL/ghost-alice-ai-secretary](https://github.com/AidALL/ghost-alice-ai-secretary)입니다. 이 페이지에서 전체 운영 안내를 확인하실 수 있습니다. 구현 경계는 [Architecture](./ARCHITECTURE.md), 소스 라이선스는 [Apache-2.0](./LICENSE), 함께 구성되는 실행 환경의 라이선스는 [서드파티 고지](./THIRD_PARTY_NOTICES.md)를 참고해 주세요.
 
@@ -17,6 +17,8 @@ AI Secretary는 KakaoTalk과 WeChat을 포함한 여러 앱에서 로컬 데스�
 - [엔드포인트와 실제 추론 확인](#엔드포인트와-실제-추론-확인)
 - [macOS 권한 확인](#macos-권한-확인)
 - [실제 작업 시작](#실제-작업-시작)
+- [검증된 파일 수집](#검증된-파일-수집)
+- [범위를 정한 예약 수집](#범위를-정한-예약-수집)
 - [중지와 재시도](#중지와-재시도)
 - [발신 작업 승인](#발신-작업-승인)
 - [사용자 지정 경로, 재설치와 제거](#사용자-지정-경로-재설치와-제거)
@@ -26,25 +28,32 @@ AI Secretary는 KakaoTalk과 WeChat을 포함한 여러 앱에서 로컬 데스�
 ## 시스템 한눈에 보기
 
 ```mermaid
-flowchart LR
-    User["사용자 / 발신자"] --> Control["Secretary 제어<br/>요청·대화·승인"]
-    Control -->|"등록 / 확인"| Ghost["Ghost-ALICE<br/>현재 입력 검사"]
-    Control -->|"불변 RunRequest"| Host["OpenClaw 어댑터<br/>agent / Gateway"]
-    Host --> Model["온프레미스 모델<br/>비전·도구 호출"]
-    Host --> Plugin["OpenClaw 플러그인<br/>작업 실행기 연결"]
-    Plugin --> Executor["Secretary 실행기"]
-    Control --> Direct["직접 호출 / MCP<br/>사용자 작업 사전 등록"]
-    Direct --> Executor
-    Control -->|"저장된 초안 승인"| Ledger["Secretary 원장<br/>작업·초안·승인<br/>효과·데스크톱 임대"]
-    Executor -->|"현재 검사 판정"| Ghost
-    Executor -->|"검증 / 기록"| Ledger
-    Executor --> Native["macOS 드라이버<br/>관찰·입력 보호"]
-    Native --> Desktop["데스크톱 앱과 파일"]
-    Executor -->|"디렉터리 목록"| Desktop
-    User -.->|"별도로 승인된 실행"| Autopilot["Autopilot (선택)<br/>작업 지속 수명 주기"]
+flowchart TB
+    User["사용자 / 발신자"] --> Control["운영자 제어<br/>요청 / 소스 / 권한 / 승인 / 중지"]
+    Control -->|"등록 / 확인"| Ghost["Ghost-ALICE<br/>현재 입력 판정"]
+    Control --> Host["OpenClaw 추론 어댑터"]
+    Host --> Model["온프레미스 모델<br/>비전 / 도구 호출"]
+    Host --> Worker["플러그인 / MCP<br/>내부 worker 권한"]
+    Control --> Core["Secretary 코어<br/>실행 조정 / 효과 실행"]
+    Worker --> Core
+    Core -->|"실시간 확인"| Ghost
+    Control -->|"정확한 승인 / 선언"| Store["AuthorityStore<br/>작업 / 권한 / 효과 / 수집 / 수명 주기"]
+    Core --> Store
+    Core --> Collect["수집 서비스<br/>소스 근거 / 검증된 파일"]
+    Collect --> Store
+    Core --> Native["NativeClient<br/>builtin 또는 선택한 Peekaboo"]
+    Native --> Desktop["macOS 앱 / 파일"]
+    Collect --> Desktop
+    Control --> Jobs["JobManager / 조정기"]
+    Jobs --> Store
+    Jobs --> Timer["OpenClaw 고정 명령 타이머"]
+    Timer -->|"원래 실행 회차"| Core
+    User -.->|"별도 승인된 실행"| Autopilot["Autopilot 수명 주기 (선택)"]
 ```
 
-화살표는 요청·도구·승인 호출을 나타냅니다. 도구 실행기가 네이티브 드라이버를 호출하며, 원장은 권한과 기록을 제공합니다. 함께 제공되는 추론 경로는 OpenClaw입니다. 직접 호출과 MCP는 이 어댑터를 거치지 않고 같은 실행기에 연결되며, 상위 호스트의 모델·네트워크를 별도로 검토하셔야 합니다. 파일 목록 조회는 Python에서 실행합니다. Autopilot은 선택 사항이며 별도 승인이 필요합니다. Secretary 설치로 활성화되지는 않습니다. 컴포넌트 의존성과 동작·재시도 흐름은 [Architecture](./ARCHITECTURE.md)를 참고해 주세요.
+화살표는 주요 제어·도구 경로를 보여 줍니다. 코어가 권한을 결정하고 효과를 기록하며, 네이티브 입력과 파일 검증은 별도 책임입니다. OpenClaw는 함께 제공하는 추론 경로와 선택해 재사용한 고정 명령 타이머를 제공합니다. 직접 운영자 호출과 MCP도 같은 코어를 사용하며, 상위 MCP 모델·네트워크는 자체 검토가 필요합니다. 예약 선언과 발신 승인은 운영자 동작입니다. Autopilot은 선택 사항이며 별도 승인이 필요합니다.
+
+구현 전에 검토한 [구조 다이어그램](./ARCHITECTURE.md#component-dependencies)을 현재 구현의 권한·수집·타이머·재시작 계약에 맞춰 유지합니다. OpenClaw의 고정 명령 타이머를 실제로 재사용하고, 선택한 네이티브 백엔드에는 Peekaboo의 필요한 라이브러리와 공개한 전용 상태·입력 패치를 연결합니다. 기존 macOS 드라이버는 독립적으로 유지하며 기본값입니다. 설치와 실제 모델·앱 준비 상태는 각각 확인해 주세요.
 
 ## 필수 준비 사항
 
@@ -63,11 +72,11 @@ Ghost-ALICE는 입력 원장과 현재 검사 판정을 제공합니다. [Autopi
 export SECRETARY_GHOST_ROOT="$HOME/ghost-alice"
 git clone https://github.com/AidALL/ghost-alice-ai-secretary.git "$HOME/ghost-alice-ai-secretary"
 cd "$HOME/ghost-alice-ai-secretary"
-./scripts/install.sh --ghost-alice-root "$SECRETARY_GHOST_ROOT"
+./scripts/install.sh --ghost-alice-root "$SECRETARY_GHOST_ROOT" --native-backend peekaboo
 python3 scripts/installer.py status
 ```
 
-설치기는 스킬, 비서 프로그램, 네이티브 도구, OpenClaw `2026.9.8`과 Node `24.21.0`을 함께 구성합니다. 기본 경로는 프로그램 `~/.local/share/ai-secretary`, 스킬 `~/.agents/skills/ai-secretary`, 등록 기록 `~/.ghost-alice/addons/ai-secretary.json`입니다. 백그라운드 서비스를 시작하거나 모델 가중치를 설치하지 않으며, 추론 준비 완료를 입증하지도 않습니다. 이미 설치하셨다면 원래 설치 경로로 아래 준비 상태 확인을 진행해 주세요.
+위 명령은 Peekaboo를 명시적으로 선택하며 독립 builtin 도구도 유지합니다. 새 설치에서 builtin을 선택하려면 `--native-backend peekaboo`를 생략해 주세요. 재설치에는 선택한 백엔드 옵션을 다시 사용해 주세요. 설치기는 스킬, 비서 프로그램, 선택한 네이티브 도구와 라이선스 고지, 소유 worker·Python 실행기, OpenClaw `2026.9.8`과 Node `24.21.0`을 함께 구성합니다. 기본 경로는 프로그램 `~/.local/share/ai-secretary`, 스킬 `~/.agents/skills/ai-secretary`, 등록 기록 `~/.ghost-alice/addons/ai-secretary.json`입니다. 백그라운드 서비스를 시작하거나 모델 가중치를 설치하지 않으며, 추론 준비 완료를 입증하지도 않습니다. 이미 설치하셨다면 원래 설치 경로로 아래 준비 상태 확인을 진행해 주세요.
 
 Core의 공식 `ai-secretary` 별칭은 [Core 통합 PR #47](https://github.com/AidALL/ghost-alice/pull/47)에서 준비 중이며 병합·배포를 기다리고 있습니다. 설치된 Core에서 해당 통합을 사용할 수 있기 전까지는 이 애드온의 설치기를 사용해 주세요. 기존 Core의 일반 `--addon-source` 경로는 스킬 내용을 설치하며, 이 전체 실행 환경을 구성하지 않습니다.
 
@@ -79,9 +88,9 @@ Core의 공식 `ai-secretary` 별칭은 [Core 통합 PR #47](https://github.com/
 | --- | --- |
 | 운영자 결정: 모델과 네트워크 | 활성 온프레미스 URL과 정확한 모델 ID를 다시 확인해 주세요. 실제 비전·도구 호출·네트워크 격리와 상위 MCP 호스트·대체 모델·채널·텔레메트리를 검토해 주세요. provider 이름이나 설정 선언만으로 입증할 수는 없습니다. |
 | 운영자 결정: 첫 작업 | 앱·창, 선택한 첨부파일이나 파일, 절대 목적지 경로와 관찰 가능한 성공 조건을 정해 주세요. 실제 저장 파일이나 앱 결과를 확인해 주세요. 설치·권한·프로토콜 검사는 서로 다른 단계를 입증합니다. |
-| 발신자 결정: 정확한 발신 승인 | 저장된 계정·수신자·본문·첨부파일 해시·초대 세부 정보를 검토한 뒤 정확한 digest를 승인해 주세요. 일반 데스크톱 권한은 발신을 승인하지 않습니다. |
+| 발신자 결정: 정확한 발신 승인 | 저장된 계정·수신자·본문·첨부파일 해시·작성창 식별자·의도·초대 세부 정보를 검토한 뒤 정확한 digest를 승인해 주세요. 일반 데스크톱 권한은 발신을 승인하지 않습니다. |
 | 구현 공백: 앱의 의미 | 실제 작성 화면이 승인한 초안과 일치하는지 확인하고 최종 효과를 관찰해 주세요. 발신 버튼 이름 검사만으로 모든 불투명한 앱의 의미나 작성 화면·초안의 일치를 입증할 수는 없습니다. |
-| 구현 공백: 복구 | Gateway 중지 방법을 확인해 주세요. 로컬 클라이언트 중지만으로 Gateway 작업 중지를 입증할 수는 없습니다. 재시도 전에 실제 효과를 확인해 주세요. `Applying` 또는 `Unknown`은 근거에 따른 결과 확인·정리가 필요하며 자동화되어 있지 않습니다. |
+| 구현 공백: 복구 | Gateway 중지 방법을 확인해 주세요. 로컬 클라이언트 중지만으로 Gateway 작업 중지를 입증할 수는 없습니다. 재시도 전에 실제 효과를 확인해 주세요. 살아 있는 원래 retrieval은 관찰·검증 등록을 재개할 수 있으며, 종료된 `Unknown` 복구는 수동입니다. 제거 전에 중지·정리와 소유 Gateway 종료를 진행해 주세요. |
 | 배포 공백: Core 별칭 | 공식 별칭은 [PR #47](https://github.com/AidALL/ghost-alice/pull/47)에서 병합·배포를 기다리고 있습니다. 설치된 Core에 해당 통합이 전달되기 전까지는 이 애드온의 전체 설치기를 사용해 주세요. Secretary 설치가 선택 사항인 Autopilot 작업을 승인하지는 않습니다. |
 | 앱별 검증 | 확인 근거를 실제로 검사한 앱과 작업 흐름에 한정해 주세요. 한 번의 범위가 정해진 작업 성공만으로 KakaoTalk·WeChat이나 다른 앱의 첨부파일·작성 화면·발신 동작을 입증할 수는 없습니다. |
 
@@ -95,7 +104,7 @@ export PATH="$SECRETARY_PREFIX/managed/bin:$PATH"
 openclaw config file
 ```
 
-실행기는 `<prefix>/state/openclaw.json`과 `<prefix>/state/openclaw/`를 선택합니다. 기본 활성 설정 파일은 `~/.local/share/ai-secretary/state/openclaw.json`입니다. 관리 대상 템플릿인 `<prefix>/managed/config/openclaw.json` 대신 이 변경 가능한 상태 설정을 수정해 주세요. 기존 상태 설정은 재설치 시 보존되므로, 재설치가 엔드포인트나 모델 선택을 초기화하지 않습니다.
+실행기는 `<prefix>/state/openclaw.json`과 `<prefix>/state/openclaw/`를 선택합니다. 기본 활성 설정 파일은 `~/.local/share/ai-secretary/state/openclaw.json`입니다. 관리 대상 템플릿인 `<prefix>/managed/config/openclaw.json` 대신 이 변경 가능한 상태 설정을 수정해 주세요. 기존 상태 설정은 재설치 시 보존되므로, 재설치가 엔드포인트나 모델 선택을 초기화하지 않습니다. 네이티브 백엔드·바이너리와 예약 실행기 경로는 별도 `<prefix>/state/secretary/runtime.json`에 저장하며, 관리 대상 `config/runtime.json`도 초기화 템플릿입니다.
 
 | 확인 | 입증하는 범위 | 별도로 확인할 사항 |
 | --- | --- | --- |
@@ -188,7 +197,7 @@ curl --fail --silent --show-error "$SECRETARY_OLLAMA_URL/api/chat" \
 ai-secretary doctor
 ```
 
-`accessibility`와 `screen_recording`을 확인해 주세요. 하나라도 false이면 macOS 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용 / 화면 기록에서 실행 환경에 권한을 허용한 뒤 같은 환경에서 다시 실행해 주세요. 현재 doctor의 `model_endpoint` localhost 문구는 활성 설정에 다른 온프레미스 서버를 지정해도 고정되어 있습니다. Doctor는 모델 연결, 모델 로딩이나 추론을 검사하지 않습니다.
+Doctor는 선택한 백엔드와 실제 기능 목록, `accessibility`와 `screen_recording`을 보고합니다. Peekaboo는 click·type·hotkey와 Secretary의 보호된 focus·open을 제공하며, drag·포인트 scroll은 builtin 기능입니다. 설치된 백엔드는 `ai-secretary backend peekaboo --binary "$SECRETARY_PREFIX/managed/app/build/desktop-secretary-peekaboo"` 또는 `ai-secretary backend builtin --binary "$SECRETARY_PREFIX/managed/app/build/desktop-secretary"`로 명시적으로 선택해 주세요. 선택은 변경 가능한 runtime 상태에 저장하며, 시작됐을 수 있는 효과를 다른 백엔드로 자동 재시도하지 않습니다. `accessibility`와 `screen_recording`을 확인해 주세요. 하나라도 false이면 macOS 시스템 설정 → 개인정보 보호 및 보안 → 손쉬운 사용 / 화면 기록에서 실행 환경에 권한을 허용한 뒤 같은 환경에서 다시 실행해 주세요. 현재 doctor의 `model_endpoint` localhost 문구는 활성 설정에 다른 온프레미스 서버를 지정해도 고정되어 있습니다. Doctor는 모델 연결, 모델 로딩이나 추론을 검사하지 않습니다.
 
 ## 실제 작업 시작
 
@@ -223,21 +232,121 @@ ai-secretary --session agent:main:secretary invoke secretary_files \
 
 네이티브 session ID가 있는 대화를 이어갈 때는 `--session`에 `sessionKey::sessionId`를 지정해 주세요. OpenClaw `/new`와 `/reset`은 네이티브 세션 식별자로 이전 작업을 분리합니다. 사용자 실행기 없이 오래된 세션을 재사용하는 경로는 현재 요청 연결을 보장하지 않습니다.
 
+## 검증된 파일 수집
+
+일반 포그라운드 컴퓨터 조작에는 등록된 작업이 있으면 됩니다. 범위가 정해진 반복 수집과 출처·커서 기록이 필요할 때 수집 소스를 설정해 주세요. 직접 수집과 고정 예약 레시피는 모델을 호출하지 않습니다.
+
+로컬 폴더 소스에는 수집할 파일이 있는 폴더를 선택해 주세요. 아래 예시는 받은 파일용 폴더와 범위 설정 파일을 만듭니다. 폴더에는 사용하실 실제 파일을 넣어 주세요. 한도는 collect·ingest·resume 호출을 합친 원래 실행 전체에 적용합니다. 재사용한 파일 기록을 포함해 검증된 항목이 남은 한도를 사용하며, `filename_glob`은 상대 경로를 선택합니다.
+
+```sh
+export SECRETARY_INBOX="$HOME/Downloads/Secretary-Inbox"
+mkdir -p "$SECRETARY_INBOX"
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+Path("secretary-local-source.json").write_text(json.dumps({
+    "root": os.environ["SECRETARY_INBOX"], "recipe": "local-snapshot",
+    "filename_glob": "*", "max_items": 20, "max_bytes": 16777216
+}))
+PY
+ai-secretary source configure inbox --kind local_files \
+  --scope-file secretary-local-source.json
+export SECRETARY_EXPIRY="$(python3 -c 'from datetime import datetime,timedelta,timezone; print((datetime.now(timezone.utc)+timedelta(days=1)).isoformat())')"
+SECRETARY_GRANT_JSON="$(ai-secretary source grant inbox \
+  --expires-at "$SECRETARY_EXPIRY" \
+  --text "$SECRETARY_INBOX 폴더의 파일을 앞으로 하루 동안 15분마다 수집하고 로컬에 보관해 줘.")"
+SECRETARY_GRANT_ID="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["grant_id"])' "$SECRETARY_GRANT_JSON")"
+ai-secretary collect "$SECRETARY_GRANT_ID"
+ai-secretary artifacts --source-id inbox
+```
+
+실제 요청을 담은 `--text`는 별도의 `standing:<source>:<UUID>` 요청 등록을 만듭니다. 이후 일반 대화 입력이 해당 상시 업무의 권한을 바꾸지는 않습니다. `--text`를 생략하면 다른 제어 동작으로 처리됩니다. 선택한 `--session`의 현재 등록된 요청에 권한을 연결하므로, 현재 모델 작업이 수집할 소스에는 이 방식을 사용해 주세요. 모델은 어느 권한도 새로 만들거나 범위를 넓힐 수 없습니다. 모델 collect·ingest는 현재 worker의 정확한 session·admission·task·input에 연결된 권한을 요구합니다. 소스가 설정됐다는 이유로 별도 상시 업무의 권한을 가져올 수 없으며, 전용 상시 권한은 고정 타이머 또는 운영자 `collect GRANT_ID`가 실행합니다. 소스 개정은 물리적인 root·앱·계정·대화 식별자를 유지하며, 다른 물리적 소스에는 다른 source ID를 사용해 주세요. `ai-secretary source revoke inbox`로 권한을 철회할 수 있습니다.
+
+검증된 파일 기록에는 내용 해시·크기·소스·항목 식별자와 출처가 있고, 실제 blob은 `<prefix>/state/secretary/artifacts`에 저장됩니다. 로컬 폴더 수집은 허용한 범위의 안정적인 파일 스냅샷을 확인하며, 다른 앱의 파일 생성이 끝났다는 사실을 증명하지는 않습니다.
+
+### 데스크톱 첨부파일 레시피
+
+`desktop-attachment-v1`은 여러 앱에 같은 일반 레시피를 사용합니다. 관찰한 앱에서 정확한 계정·대화·항목·다운로드 제어와 완료 상태 변화를 설정해 주세요. 앱이 무인 검증 수집에 충분한 근거를 제공하지 않더라도 일반 대화형 마우스·키보드 작업은 사용할 수 있습니다.
+
+아래는 모든 필드를 갖춘 자체 테스트 창 형태의 범위 예시입니다. 실제 앱에서는 root와 관찰한 식별자·selector로 바꿔 주세요. 개발용 자체 테스트 창에는 이 문구가 실제로 있으며, 설치 대상에서 제외되고 폐기 가능한 테스트 파일만 만듭니다.
+
+```json
+{
+  "root": "/absolute/path/to/downloads",
+  "recipe": "desktop-attachment-v1",
+  "app": "local.ai-secretary.fixture",
+  "account": "fixture-account",
+  "conversation": "fixture-conversation",
+  "max_items": 1,
+  "max_bytes": 1048576,
+  "desktop": {
+    "app_selector": {"field": "bundle_id", "equals": "local.ai-secretary.fixture"},
+    "window_title": "AI Secretary Self-Owned Test Fixture",
+    "account_selector": {"role": "AXStaticText", "identifier": "fixture-account", "text": "fixture-account"},
+    "conversation_selector": {"role": "AXStaticText", "identifier": "fixture-conversation", "text": "fixture-conversation"},
+    "items": [{
+      "item_id": "attachment-1",
+      "item_selector": {"role": "AXStaticText", "identifier": "fixture-item", "text": "Attachment: fixture-download.txt"},
+      "download_selector": {"role": "AXButton", "identifier": "fixture-download", "text": "Download Synthetic File"},
+      "filename": "fixture-download.txt",
+      "completion": {
+        "before": {"role": "AXStaticText", "identifier": "fixture-status", "text": "No download yet"},
+        "after": {"role": "AXStaticText", "identifier": "fixture-status", "text": "Downloaded: fixture-download.txt"}
+      }
+    }]
+  }
+}
+```
+
+실제 앱에 맞춘 범위를 `secretary-desktop-source.json`으로 저장하고 `ai-secretary source configure selected-attachments --kind desktop_attachments --scope-file secretary-desktop-source.json`을 실행해 주세요. 실제 요청으로 권한을 부여한 뒤 반환된 grant ID로 수집합니다. before·after selector는 같은 표시 노드를 가리켜야 하며, after 문구에는 정확한 파일명이 있어야 합니다. 항목의 선택 필드 `expected_size`와 `expected_sha256`으로 완료 근거를 보강할 수 있습니다. 기존에 같은 이름으로 있던 파일이나 파일 출현만으로는 통과하지 않습니다.
+
+다운로드가 지연되면 원래 retrieval과 operation을 유지합니다. 원래 권한이 유효한 동안 `ai-secretary source list`의 `active_run_id`와 `unresolved_retrieval_id`를 확인하고 `ai-secretary collect GRANT_ID --run-id ORIGINAL_RUN_ID` 또는 `ai-secretary ingest ORIGINAL_RUN_ID ORIGINAL_RETRIEVAL_ID /absolute/original/file`을 사용해 주세요. 두 경로는 다운로드 입력을 다시 하지 않고 원래 후보를 관찰·검증·등록합니다. 항목 하나의 검증은 해당 커서만 전진시킵니다. 원래 저장한 항목이 남거나 소스의 불확실성이 해결되지 않으면 전체 실행은 `Pending`을 유지하며, 명시적인 collect가 새로운 검사를 거쳐 원래 항목 집합을 계속합니다. 중지·철회·프로세스 비정상 종료로 종료된 `Unknown`에는 이 살아 있는 실행의 재개 경로를 적용할 수 없습니다.
+
+모델 도구는 `secretary_collect({"source_id":"…"})`, `secretary_ingest({"source_id":"…","retrieval_id":"…","path":"…"})`, `secretary_artifacts({"source_id":"…"})`입니다. 실행 식별자는 호스트가 내부에서 결정하며, 모델 인자로 grant·session·완료 판정·권한 기록을 전달할 수 없습니다.
+
+## 범위를 정한 예약 수집
+
+위 안내대로 소유한 포그라운드 Gateway를 유지하고 수집에 사용한 터미널도 열어 두세요. 같은 prefix·PATH를 사용하는 다른 터미널에서 Secretary 조정기를 명시적으로 시작해 주세요.
+
+```sh
+ai-secretary schedule start
+```
+
+`SECRETARY_GRANT_ID`가 설정된 원래 수집 터미널로 돌아와 한도가 있는 예약 업무를 선언해 주세요.
+
+```sh
+SECRETARY_JOB_JSON="$(ai-secretary schedule create "$SECRETARY_GRANT_ID" \
+  --every 900 --max-runs 96 --max-lateness 60 --misfire skip)"
+SECRETARY_JOB_ID="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["job_id"])' "$SECRETARY_JOB_JSON")"
+ai-secretary schedule list
+ai-secretary schedule reconcile
+```
+
+일회성 예약은 `--every` 대신 시간대가 있는 ISO 시각으로 `--at`을 사용해 주세요. 반복 간격에는 `--start-at`으로 기준 시각을 지정할 수 있습니다. 예약은 권한 만료 시각 안에서만 유효합니다. 놓친 실행 처리에는 `skip`과 `coalesce`를 지원하며, 달력형 cron 표현식은 지원하지 않습니다.
+
+조정기가 고정 명령을 갖는 실행 한 차례씩을 등록하고 저장된 선언을 복구하며, OpenClaw가 실제 시각에 실행합니다. 모델을 호출하거나 메시지·실패 알림을 보내지 않습니다. 설치만으로 두 프로세스를 시작하거나 예약 업무를 허용하지는 않습니다. `ai-secretary schedule cancel "$SECRETARY_JOB_ID"`는 업무 하나를 철회하고, `ai-secretary schedule stop`은 관계없는 포그라운드 작업을 유지하면서 예약 수명 주기와 소유한 타이머를 중지합니다.
+
+원격 생성 결과가 불확실할 때 목록이 비어 있다는 이유로 다시 생성하지 않습니다. 늦게 생성된 타이머도 로컬 취소 이후까지 소유한 정리 의무로 남습니다. 확인되지 않은 생성 작업이나 미완료 정리는 `Draining` 상태와 제거 차단으로 이어지므로, 상태와 조정에 필요한 소유 도구를 유지해 주세요.
+
 ## 중지와 재시도
 
-위에서 시작한 포그라운드 Gateway를 중지하려면 해당 터미널에서 Ctrl-C를 누르고 프로세스가 종료될 때까지 기다려 주세요. `ai-secretary run` 터미널의 Ctrl-C는 로컬 클라이언트를 정리하며, Gateway 작업 중지를 입증하지 않습니다. 작업이 계속 실행 중일 수 있는 상황에서 클라이언트를 중단하셨다면 포그라운드 Gateway도 중지해 주세요.
+예약 수집만 중지하려면 `ai-secretary schedule stop`을 사용해 주세요. 재시도나 애드온 제거 전에 소유한 모든 실행 수명 주기의 권한을 무효화하고 정리하려면 `ai-secretary stop`을 사용해 주세요. 반환된 `Stopped` 또는 `Draining` 상태를 확인해 주세요. 중지는 권한 무효화를 먼저 기록한 뒤 데스크톱·네이티브·타이머 생성 작업의 종료를 기다리며, 불확실한 효과와 정리 의무를 보존합니다.
 
-재시도 전에 실제 업무 효과를 확인해 주세요. 파일이 저장되었는지, 작성창이 바뀌었는지, 메시지가 발신되었는지 해당 앱을 다시 관찰하고 저장 파일이나 발신 결과를 확인해 주세요. 완료된 동일 효과의 OperationId는 기록된 결과를 재사용하며, 다른 효과는 같은 ID를 재사용할 수 없습니다. 작업 실행기가 결과를 저장할 수 있으면 불확실한 결과를 `Unknown`으로 기록하지만, 강제 중단되면 `Applying`으로 남을 수 있습니다. 두 상태 모두 다음 시도 전에 실제 효과 확인과 조정이 필요합니다. OS 입력 완료만으로 파일 저장이나 메시지 발신을 입증할 수는 없습니다. 자동 조정은 구현되지 않았습니다. 상태를 보존하고 실제 근거로 불확실한 효과를 해결한 뒤 같은 효과를 다시 요청해 주세요.
+포그라운드 Gateway는 해당 터미널에서 Ctrl-C를 누르고 종료를 기다려 주세요. `ai-secretary run`의 Ctrl-C는 로컬 클라이언트를 정리하며, Gateway 작업 중지를 입증하지 않습니다. 재설치·제거 전에는 소유 클라이언트·조정기 프로세스와 소유 Gateway를 종료해 주세요. 설치기는 실행 자원 소유와 저장된 종료 상태를 확인하고 정리가 남으면 제거를 거부합니다. 중지를 자동으로 완료하거나 불확실한 원격 생성을 해결하지는 않습니다.
+
+효과를 반복하기 전에 실제 파일·작성창·발신 결과를 확인해 주세요. 같은 효과의 `Applied` OperationId는 기록된 결과를 재사용하며 다른 효과에 재사용할 수 없습니다. 효과가 없었다고 입증된 실패는 원래 의도한 operation으로 재시도할 수 있습니다. `Applying`이나 `Unknown`에서 무작정 재시도하거나 새 operation ID를 만들어서는 안 됩니다. 일반 OS 입력 전달은 파일 저장·메시지 발신을 입증하지 않습니다.
+
+살아 있는 첨부파일 실행이 자기 소유의 미확인 retrieval을 갖고 있으면 결과 확인 권한과 소스 점유를 유지합니다. 위 원래 실행의 collect·ingest 명령을 사용하고 다시 클릭하지 마세요. 프로세스 비정상 종료·중지·철회 이후 종료된 불확실한 실행에는 현재 자동 해결기가 없습니다. 기록을 보존하고 실제 근거에 따른 운영자 복구를 진행해 주세요.
 
 ## 발신 작업 승인
 
-사용자가 발신자이며 정확한 초안을 승인합니다. Secretary는 `secretary_draft`에 계정·수신자·본문·첨부파일 내용 해시·초대 세부사항을 저장한 뒤 초안을 보여 줍니다. 사용자의 대화형 터미널에서 저장된 초안과 실제 digest를 검토해 주세요.
+사용자가 발신자이며 정확한 초안을 승인합니다. Secretary는 `secretary_draft`에 계정·수신자·본문·첨부파일 내용 해시·정확한 `composer: {pid, process_start, window_id}`·`intent`·초대 세부사항을 저장한 뒤 초안을 보여 줍니다. 사용자의 대화형 터미널에서 저장된 초안과 실제 digest를 검토해 주세요.
 
 ```sh
 ai-secretary approve ACTUAL_DRAFT_ID --digest ACTUAL_DRAFT_DIGEST
 ```
 
-명령은 저장된 기록을 출력하고 `APPROVE ACTUAL_DRAFT_DIGEST` 입력을 요청합니다. 자리표시자는 저장된 실제 값으로 바꿔 주세요. 초안이 바뀌면 승인이 무효화되고, 발신 전에 실제 앱 작성창과 승인된 내용이 일치해야 합니다. 일반적인 컴퓨터 조작 권한은 메시지·답장·초대 발신을 허용하지 않습니다. 등록한 작업 안의 읽기, 다운로드, 폴더 열기와 초안 준비에는 클릭마다 승인을 요구하지 않습니다.
+발신 동작에는 승인된 정확한 `outbound: {draft_id, content}`를 전달하며, 관찰한 대상은 해당 composer와 일치해야 합니다. 명령은 저장된 기록을 출력하고 `APPROVE ACTUAL_DRAFT_DIGEST` 입력을 요청합니다. 자리표시자는 저장된 실제 값으로 바꿔 주세요. 초안이 바뀌면 승인이 무효화되고, 발신 전에 실제 앱 작성창과 승인된 내용이 일치해야 합니다. 일반적인 컴퓨터 조작 권한은 메시지·답장·초대 발신을 허용하지 않습니다. 등록한 작업 안의 읽기, 다운로드, 폴더 열기와 초안 준비에는 클릭마다 승인을 요구하지 않습니다.
 
 발신 버튼 이름 검사는 보조 장치입니다. 모든 불투명한 GUI 의미를 인식하거나 작성창과 승인 초안의 일치를 자동으로 증명하지는 않습니다. 시각 판단, 사용자의 정확한 승인과 최종 효과 관찰이 함께 필요합니다.
 
@@ -274,7 +383,7 @@ python3 scripts/installer.py status --ghost-alice-root "$SECRETARY_GHOST_ROOT" \
   --registry-dir "$SECRETARY_REGISTRY_DIR"
 ```
 
-기본 경로에는 `./scripts/uninstall.sh`를 사용해 주세요. 제거는 변경되지 않은 소유 프로그램·스킬·등록 리소스를 대상으로 합니다. 사용자 수정, 기존 미소유 리소스, 작업 원장, OpenClaw 대화와 모델 설정은 보존됩니다. 변경된 등록 기록은 프로그램·스킬 삭제 전에 제거를 차단합니다. 부분 제거는 소유권 근거와 재시도 명령을 유지하고 보존된 파일을 알립니다. 재설치에는 잠금·스테이징·롤백·중단 설치 복구가 적용되며, `status`도 잠금 안에서 복구 경로에 진입합니다.
+제거 전에는 위 중지·정리와 소유 Gateway 종료를 완료해 주세요. 남은 실행 권한·네이티브 소유·타이머·불확실한 생성 작업은 삭제를 차단하며 설치된 정리 도구를 보존합니다. 기본 경로에는 `./scripts/uninstall.sh`를 사용해 주세요. 제거는 변경되지 않은 소유 프로그램·스킬·등록 리소스를 대상으로 합니다. 사용자 수정, 기존 미소유 리소스, 작업 원장, OpenClaw 대화와 모델 설정은 보존됩니다. 변경된 등록 기록은 프로그램·스킬 삭제 전에 제거를 차단합니다. 부분 제거는 소유권 근거와 재시도 명령을 유지하고 보존된 파일을 알립니다. 재설치에는 잠금·스테이징·롤백·중단 설치 복구가 적용되며, `status`도 잠금 안에서 복구 경로에 진입합니다.
 
 여러 스킬 위치에는 `--skills-dir`를 반복해 주세요. `--claude`는 Claude 스킬 디렉터리도 추가하므로 최초 설치에 사용했다면 이후 작업에도 재사용해 주세요. Core의 플랫폼 등록 경로를 명시적으로 선택하려면 해당 스킬 디렉터리와 함께 `--platform-registry codex=/absolute/dir`, `--platform-registry claude=/absolute/dir`를 반복해 주세요. `--platform-registry`와 `--registry-dir`는 함께 사용하지 마세요. 이후 status·재설치·제거에 정확한 원래 플랫폼·스킬 선택을 사용해 주세요. 기록된 등록 경로 선택을 바꾸려면 기존 선택으로 제거한 뒤 새 선택으로 설치해야 하며, 작업·대화 상태는 보존됩니다.
 
@@ -288,20 +397,20 @@ python3 scripts/installer.py status --ghost-alice-root "$SECRETARY_GHOST_ROOT" \
 
 ## 개발 검증
 
-저장소에는 코어 계약, 패키지 단독 실행, 프로토콜, 설치·제거와 선택적으로 실행하는 실제 macOS 자체 테스트 창 검사가 포함되어 있습니다. 일반 단위 테스트는 실제 창 검사를 명시적으로 건너뜁니다. Gateway 스모크는 모델 추론 없이 상태 도구와 실제 Ghost-ALICE 판정을 검사하며, 에이전트 하네스는 로컬 프로토콜 스텁을 사용합니다. 두 검사 모두 LLM 성능이나 실제 협업 앱 작업 흐름을 입증하지 않습니다.
+저장소에는 코어 계약, 패키지 단독 실행, 프로토콜, 설치·제거와 선택적으로 실행하는 실제 macOS 자체 테스트 창 검사가 포함되어 있습니다. 일반 단위 테스트는 실제 창 검사를 명시적으로 건너뜁니다. Gateway 스모크는 내부 실행 세션에 연결되지 않은 직접 HTTP 도구 호출이 거부되는지 확인하며, 입력 등록·미등록·현재 Ghost-ALICE 차단 조건은 별도로 검사합니다. 에이전트 하네스는 로컬 프로토콜 스텁으로 정상적인 실행 세션에서 네이티브 권한 상태까지 이어지는 흐름을 검사합니다. 두 검사 모두 LLM 성능이나 실제 협업 앱 작업 흐름을 입증하지 않습니다.
 
 `SECRETARY_GHOST_ROOT`는 설치된 Ghost-ALICE 소스 경로이며 기본값은 `~/ghost-alice`입니다. `SECRETARY_NODE`는 Node를 선택하고 기본값은 PATH입니다. 설치된 전용 Node를 지정하면 스모크 실행 환경을 명확하게 선택하실 수 있습니다.
 
 ```sh
 export SECRETARY_GHOST_ROOT="$HOME/ghost-alice"
 export SECRETARY_NODE="$HOME/.local/share/ai-secretary/managed/node/bin/node"
-./scripts/build_native.sh
+./scripts/build_native.sh --backend all --test-window
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 AI_SECRETARY_NATIVE_BINARY=build/desktop-secretary PYTHONPATH=src \
   python3 -m unittest discover -s tests -p test_native.py -v
 ```
 
-마지막 명령은 테스트 창을 잠시 열어 실제 입력·저장·스크린샷을 검사합니다. 이 테스트 창으로 협업 앱 동작을 입증하지는 않습니다. 모델 추론 없이 고정 실행 환경을 검사하려면 결과를 로컬 임시 경로에 유지해 주세요.
+선택한 제품을 검사하려면 같은 네이티브 테스트 명령에 `AI_SECRETARY_NATIVE_BACKEND=peekaboo`와 `AI_SECRETARY_NATIVE_BINARY=build/desktop-secretary-peekaboo`를 지정해 주세요. 마지막 명령은 테스트 창을 잠시 열어 실제 입력·저장·스크린샷을 검사합니다. 이 테스트 창으로 협업 앱 동작을 입증하지는 않습니다. 모델 추론 없이 고정 실행 환경을 검사하려면 결과를 로컬 임시 경로에 유지해 주세요.
 
 ```sh
 python3 scripts/smoke_openclaw.py \
@@ -310,3 +419,8 @@ python3 scripts/smoke_agent_harness.py \
   --runtime "$HOME/.local/share/ai-secretary/managed/openclaw" \
   --output .tmp/agent-harness --admission-mode user-run
 ```
+
+
+2026-10-09의 범위가 정해진 소스 검증에서는 실제 Peekaboo Unicode 입력·클릭·파일 생성·창 캡처, 일반 데스크톱 레시피의 58바이트 파일 검증, 미래 시각의 Gateway 고정 명령 타이머를 통한 48바이트 로컬 파일 검증과 소유 원격 타이머 잔여 0건을 확인했습니다.
+
+별도의 폐기 가능한 prefix 설치에서는 설정 검증·스킬 인식·플러그인 로딩을 통과했습니다. 현재 설치된 Peekaboo 바이너리는 04:13:13 UTC에 실제 focus·클릭·Unicode 입력·다운로드·창 스크린샷과 변조된 관찰 거부를 검사하여, 건너뛰기 없이 두 테스트를 통과했습니다. 설치된 일반 레시피의 검증된 58바이트 파일은 원래 04:04:11 UTC 근거를 유지하며, 설정 루트 경계 수정 뒤 해당 수집 근거를 재사용했습니다. 04:14:52 UTC에는 설치기가 소유한 Python 실행기와 Gateway가 미래 시각의 고정 명령 타이머를 완료하고 45바이트 파일을 검증했으며, 소유 원격 타이머 잔여 0건과 예약 수명 주기의 `Stopped`를 확인했습니다. 클라이언트 실행 중 제거 시도는 거부되었습니다. 소유 Gateway와 수명 주기를 중지한 뒤 04:16:48 UTC에 독립 설치의 제거를 통과하여, 소유한 관리 파일·스킬·등록만 제거하고 상태 파일 580개와 다른 스킬·등록 리소스를 그대로 보존했습니다. 이 비교에서는 일시적인 SQLite WAL/SHM 파일을 제외했습니다. 폐기 가능한 로컬 데이터를 사용했으며 메시지나 추론을 실행하지 않았습니다. 독립 설치의 해당 경로를 확인한 결과이며, 실제 온프레미스 추론·KakaoTalk·WeChat 작업과 사용자 일반 설치의 제거·갱신 완료는 자체 근거가 필요합니다. 네이티브 status의 검증 표시 필드는 이 외부 테스트 기록을 읽지 않습니다.

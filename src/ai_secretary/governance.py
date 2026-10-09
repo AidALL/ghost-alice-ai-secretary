@@ -57,14 +57,24 @@ class Governance:
             event = observation["input_event_id"]
             task = row[3] if row and not new_task else "task-" + hashlib.sha256((session + event).encode()).hexdigest()[:40]
             from .ledger import Ledger
-            if not row or new_task: Ledger(self.root / "operations.sqlite").create_task(task, "user", text)
+            ledger = Ledger(self.root / "operations.sqlite")
+            from .ledger import LedgerTx
+            with ledger.store.transaction() as unit:
+                if not row or new_task:
+                    LedgerTx(unit).create_task(task, "user", text)
+                # The native acceptance point must see a new local admission
+                # even if it races after the async Ghost check. This is local
+                # invalidation, not a global transaction with Ghost storage.
+                from .coordinator import AuthorityRepository
+                AuthorityRepository.initialize(unit)
+                AuthorityRepository(unit).record_admission(session, admission_id, task, event)
             db.execute("INSERT OR REPLACE INTO admission VALUES(?,?,?,?,?)", (session, admission_id, digest, event, task))
             db.execute("INSERT INTO admission_history VALUES(?,?,?)", (session, admission_id, digest))
             return {"inputEventId": event, "task_id": task}
 
     async def check(self, session):
         with self.connect() as db:
-            row = db.execute("SELECT event_id,task_id FROM admission WHERE session=?", (session,)).fetchone()
+            row = db.execute("SELECT event_id,task_id,admission_id FROM admission WHERE session=?", (session,)).fetchone()
         if not row: raise PermissionError("no actual user intake bound to this conversation")
         with as_file(resource("ga-gate.mjs")) as script:
             child = await asyncio.create_subprocess_exec(os.environ.get("SECRETARY_NODE", "node"), str(script), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -78,4 +88,18 @@ class Governance:
         if child.returncode or len(output) > 65536: raise PermissionError("Ghost-ALICE bridge unavailable")
         result = json.loads(output)
         if result.get("inputEventId") != row[0]: raise PermissionError("stale Ghost-ALICE input lineage")
-        return {**result, "task_id": row[1]}
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT event_id,task_id,admission_id FROM admission WHERE session=?", (session,)).fetchone()
+            if current != row:
+                raise PermissionError("native admission changed during Ghost-ALICE check")
+            # Upgrade the current legacy admission without manufacturing intake.
+            # Hold its short local writer lock so an older sample cannot overwrite
+            # a concurrent genuine admission's authority mirror.
+            from .authority import AuthorityStore
+            from .coordinator import AuthorityRepository
+            store = AuthorityStore(self.root / "operations.sqlite")
+            with store.transaction() as unit:
+                AuthorityRepository.initialize(unit)
+                AuthorityRepository(unit).record_admission(session, row[2], row[1], row[0])
+        return {**result, "task_id": row[1], "admission_id": row[2]}

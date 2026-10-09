@@ -6,6 +6,9 @@ import sys
 from pathlib import Path
 import tempfile
 import subprocess
+import fcntl
+import sqlite3
+from contextlib import closing
 import unittest
 from unittest.mock import patch
 
@@ -74,6 +77,302 @@ class InstallerTests(unittest.TestCase):
         artifact_check = patch.object(self.subject, "_verify_cached_package")
         artifact_check.start()
         self.addCleanup(artifact_check.stop)
+
+    def _capability_builder(self):
+        build = self.source / "scripts/build_native.sh"
+        build.write_text('''#!/bin/sh
+set -eu
+backend=builtin
+output_dir=build
+scratch_path=
+cache_path=
+while [ "$#" -gt 0 ]; do
+ case "$1" in
+  --backend) backend="$2"; shift 2 ;;
+  --output-dir) output_dir="$2"; shift 2 ;;
+  --scratch-path) scratch_path="$2"; shift 2 ;;
+  --cache-path) cache_path="$2"; shift 2 ;;
+  *) exit 2 ;;
+ esac
+done
+mkdir -p "$output_dir"
+printf '#!/bin/sh\\necho native-fixture\\n' > "$output_dir/desktop-secretary"
+chmod +x "$output_dir/desktop-secretary"
+if [ "$backend" = all ]; then
+ cp "$output_dir/desktop-secretary" "$output_dir/desktop-secretary-peekaboo"
+ mkdir -p "$scratch_path" "$cache_path" "$output_dir/native-notices/Notices" "$output_dir/TestWindow.app"
+ printf scratch > "$scratch_path/intermediate"
+ printf cache > "$cache_path/intermediate"
+ printf 'pinned fixture notice' > "$output_dir/native-notices/UPSTREAM.json"
+fi
+printf '%s\\n' "$backend" "$output_dir" "$scratch_path" "$cache_path" > "$output_dir/build-arguments.txt"
+''')
+
+    def _database(self, statements):
+        path = self.prefix / "state/secretary/operations.sqlite"
+        with closing(sqlite3.connect(path)) as db, db:
+            db.executescript(statements)
+        path.chmod(0o600)
+        return path
+
+    def _assert_refusal_preserves_install(self, pattern):
+        self.assertTrue(self.subject.manifest_path.exists(), "a preceding refusal deleted the install")
+        manifest = self.subject.manifest_path.read_bytes()
+        foreign = self.registry / "foreign-addon.json"
+        foreign.write_bytes(b'{"owned_by":"somebody_else"}\n')
+        with self.assertRaisesRegex(installer.InstallError, pattern):
+            self.subject.uninstall()
+        self.assertEqual(self.subject.manifest_path.read_bytes(), manifest)
+        self.assertTrue((self.prefix / "managed/bin/openclaw").exists())
+        self.assertTrue((self.registry / "ai-secretary.json").exists())
+        self.assertEqual(foreign.read_bytes(), b'{"owned_by":"somebody_else"}\n')
+
+    def test_selected_peekaboo_builds_both_products_with_external_scratch(self):
+        self._capability_builder()
+        self.subject.native_backend = "peekaboo"
+        self.subject.install()
+        build = self.prefix / "managed/app/build"
+        self.assertTrue((build / "desktop-secretary-peekaboo").is_file())
+        self.assertTrue((build / "desktop-secretary").is_file())
+        arguments = (build / "build-arguments.txt").read_text().splitlines()
+        self.assertEqual(arguments[0], "all")
+        for value in arguments[2:]:
+            self.assertTrue(value)
+            self.assertNotIn(self.prefix / "managed", Path(value).parents)
+            self.assertFalse(Path(value).exists(), "temporary build cache was retained")
+        self.assertFalse((build / "TestWindow.app").exists())
+        self.assertTrue((build / "native-notices/UPSTREAM.json").is_file())
+        self.assertFalse(any(name in {".build", ".swiftpm", "native-peekaboo-build", "native-swiftpm-cache"}
+                             for name in (p.name for p in build.rglob("*"))))
+        self.assertEqual(self.subject._manifest()["native_backend"], "peekaboo")
+
+    def test_runtime_selection_initializes_private_configuration_and_preserves_user_bytes(self):
+        self._capability_builder()
+        self.subject.native_backend = "peekaboo"
+        self.subject.install()
+        template = self.prefix / "managed/config/runtime.json"
+        mutable = self.prefix / "state/secretary/runtime.json"
+        self.assertTrue(mutable.exists(), "private runtime selection was not initialized")
+        config = json.loads(mutable.read_text())
+        expected = {"native_backend": "peekaboo", "native_binary": str(self.prefix / "managed/app/build/desktop-secretary-peekaboo"),
+            "python_executable": str(self.prefix / "managed/bin/ai-secretary-python"), "openclaw_executable": str(self.prefix / "managed/bin/openclaw"),
+            "openclaw_state": str(self.prefix / "state/openclaw"), "openclaw_config": str(self.prefix / "state/openclaw.json")}
+        self.assertEqual(config, expected)
+        self.assertEqual(json.loads(template.read_text()), expected)
+        self.assertEqual(mutable.stat().st_mode & 0o777, 0o600)
+        user_bytes = b'{ "native_backend" : "builtin", "native_binary": "/private/custom/helper", "operator_note": "keep bytes" }\n'
+        mutable.write_bytes(user_bytes)
+        model = self.prefix / "state/openclaw.json"
+        model_bytes = model.read_bytes() + b"\n"
+        model.write_bytes(model_bytes)
+        (self.source / "README.md").write_text("New source requiring owned refresh.\n")
+        self.subject.install()
+        self.assertEqual(mutable.read_bytes(), user_bytes)
+        self.assertEqual(model.read_bytes(), model_bytes)
+        self.subject.uninstall()
+        self.assertEqual(mutable.read_bytes(), user_bytes)
+        self.assertEqual(model.read_bytes(), model_bytes)
+
+    def test_selected_backend_build_failure_does_not_publish_baseline_as_fallback(self):
+        self.subject.native_backend = "peekaboo"
+        with self.assertRaisesRegex(installer.InstallError, "peekaboo"):
+            self.subject.install()
+        self.assertFalse((self.prefix / "managed").exists())
+        self.assertFalse((self.registry / "ai-secretary.json").exists())
+
+    def test_default_refresh_retains_backend_selected_by_existing_mutable_runtime(self):
+        self._capability_builder()
+        self.subject.native_backend = "peekaboo"
+        self.subject.install()
+        runtime = self.prefix / "state/secretary/runtime.json"
+        original = runtime.read_bytes()
+        self.subject.native_backend = "builtin"
+        self.subject.install()
+        self.assertEqual(runtime.read_bytes(), original)
+        self.assertTrue((self.prefix / "managed/app/build/desktop-secretary-peekaboo").is_file(),
+                        "default refresh removed the still-selected backend")
+
+    def test_runtime_configuration_symlink_refuses_install(self):
+        target = self.base / "foreign-runtime.json"
+        target.write_text("valuable")
+        state = self.prefix / "state/secretary"
+        state.mkdir(parents=True, mode=0o700)
+        (state / "runtime.json").symlink_to(target)
+        with self.assertRaisesRegex(installer.InstallError, "runtime.json"):
+            self.subject.install()
+        self.assertEqual(target.read_text(), "valuable")
+        self.assertFalse((self.prefix / "managed").exists())
+
+    def test_cli_accepts_explicit_native_backend(self):
+        from unittest.mock import MagicMock
+        subject = MagicMock()
+        subject.status.return_value = {"status": "not-installed"}
+        with patch.object(installer, "Installer", return_value=subject) as constructor, patch("builtins.print"):
+            try:
+                result = installer.main(["status", "--native-backend", "peekaboo"])
+            except SystemExit:
+                self.fail("installer CLI rejected the explicit native backend")
+            self.assertEqual(result, 0)
+        self.assertEqual(constructor.call_args.kwargs["native_backend"], "peekaboo")
+
+    def test_uninstall_refuses_every_unresolved_scheduler_phase_and_unknown_producer(self):
+        self.subject.install()
+        path = self._database("CREATE TABLE scheduler_outbox(declaration_key TEXT,phase TEXT); CREATE TABLE scheduler_producers(declaration_key TEXT,state TEXT);")
+        for phase in ("Pending", "Creating", "Unknown", "Acked", "Removing"):
+            with self.subTest(phase=phase):
+                with closing(sqlite3.connect(path)) as db, db:
+                    db.execute("DELETE FROM scheduler_outbox")
+                    db.execute("INSERT INTO scheduler_outbox VALUES('owned',?)", (phase,))
+                self._assert_refusal_preserves_install("schedule stop|scheduler")
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("UPDATE scheduler_outbox SET phase='Removed'")
+        for producer in ("Creating", "Unknown"):
+            with self.subTest(producer=producer):
+                with closing(sqlite3.connect(path)) as db, db:
+                    db.execute("DELETE FROM scheduler_producers")
+                    db.execute("INSERT INTO scheduler_producers VALUES('owned',?)", (producer,))
+                self._assert_refusal_preserves_install("schedule stop|producer")
+
+    def test_uninstall_refuses_active_worker_and_applying_operation(self):
+        self.subject.install()
+        path = self._database("CREATE TABLE worker_sessions(state TEXT); INSERT INTO worker_sessions VALUES('Active');")
+        self._assert_refusal_preserves_install("worker|authority")
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute("DROP TABLE worker_sessions")
+            db.execute("CREATE TABLE operations(state TEXT)")
+            db.execute("INSERT INTO operations VALUES('Applying')")
+        self._assert_refusal_preserves_install("Applying|effect|operation")
+
+    def test_uninstall_refuses_unreadable_and_partial_authority_databases(self):
+        self.subject.install()
+        path = self.prefix / "state/secretary/operations.sqlite"
+        path.write_bytes(b"this is not a database")
+        path.chmod(0o600)
+        self._assert_refusal_preserves_install("authority|database")
+        path.unlink()
+        self._database("CREATE TABLE authority_schema_version(version INTEGER); INSERT INTO authority_schema_version VALUES(1);")
+        self._assert_refusal_preserves_install("schema|authority")
+
+    def test_legacy_quiescent_database_and_stable_private_locks_survive_uninstall(self):
+        self.subject.install()
+        path = self._database("CREATE TABLE operations(state TEXT); INSERT INTO operations VALUES('Unknown');")
+        original = path.read_bytes()
+        lock = path.parent / "desktop-dispatch.lock"
+        lock.write_bytes(b"")
+        lock.chmod(0o600)
+        inode = lock.stat().st_ino
+        self.assertEqual(self.subject.uninstall()["status"], "uninstalled")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(lock.stat().st_ino, inode)
+
+    def test_inherited_desktop_lock_refuses_uninstall_after_parent_closes_its_fd(self):
+        self.subject.install()
+        self._database("CREATE TABLE operations(state TEXT);")
+        lock = self.prefix / "state/secretary/desktop-dispatch.lock"
+        descriptor = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        child = subprocess.Popen([sys.executable, "-c", "import sys,time; print('ready',flush=True); time.sleep(20)"],
+                                 pass_fds=(descriptor,), stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            os.close(descriptor)
+            descriptor = None
+            self._assert_refusal_preserves_install("desktop|ownership")
+        finally:
+            if descriptor is not None: os.close(descriptor)
+            child.terminate()
+            child.communicate(timeout=5)
+
+    def test_uninstall_retains_desktop_lock_until_last_owned_resource_is_removed(self):
+        self.subject.install()
+        self._database("CREATE TABLE operations(state TEXT);")
+        lock = self.prefix / "state/secretary/desktop-dispatch.lock"
+        lock.write_bytes(b"")
+        lock.chmod(0o600)
+        original = Path.unlink
+        observations = []
+        def check_during_removal(path, *args, **kwargs):
+            if path == self.prefix / "managed/app/scripts/installer.py":
+                descriptor = os.open(lock, os.O_RDWR)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    observations.append("retained")
+                finally:
+                    os.close(descriptor)
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "unlink", check_during_removal):
+            self.subject.uninstall()
+        self.assertEqual(observations, ["retained"])
+
+    def test_refresh_refuses_live_runtime_before_replacing_any_owned_resource(self):
+        self.subject.install()
+        self._database("CREATE TABLE operations(state TEXT); INSERT INTO operations VALUES('Applying');")
+        old = (self.prefix / "managed/app/README.md").read_bytes()
+        (self.source / "README.md").write_text("Replacement requiring refresh.\n")
+        with self.assertRaisesRegex(installer.InstallError, "Applying|effect|operation"):
+            self.subject.install()
+        self.assertEqual((self.prefix / "managed/app/README.md").read_bytes(), old)
+
+    def test_refused_refresh_does_not_initialize_missing_runtime_selection(self):
+        self.subject.install()
+        runtime = self.prefix / "state/secretary/runtime.json"
+        runtime.unlink()
+        self._database("CREATE TABLE operations(state TEXT); INSERT INTO operations VALUES('Applying');")
+        (self.source / "README.md").write_text("Replacement requiring refresh.\n")
+        with self.assertRaises(installer.InstallError):
+            self.subject.install()
+        self.assertFalse(runtime.exists(), "refused refresh changed a live runtime's backend selection")
+
+    def test_owned_client_retains_runtime_use_lock_until_process_exits(self):
+        (self.source / "src/ai_secretary/control.py").write_text("import time\nprint('ready', flush=True)\ntime.sleep(20)\n")
+        self.subject.install()
+        child = subprocess.Popen([self.prefix / "managed/bin/ai-secretary"], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            self._assert_refusal_preserves_install("runtime|client")
+        finally:
+            child.terminate()
+            child.communicate(timeout=5)
+
+    def test_uninstall_refuses_private_live_gateway_owner_without_touching_it(self):
+        self.subject.install()
+        directory = self.prefix / "state/openclaw/tmp" / ("openclaw-" + str(os.getuid()))
+        directory.mkdir(parents=True, mode=0o700)
+        owner = directory / "gateway.state.lock"
+        data = json.dumps({"pid": os.getpid(), "stateDir": str(self.prefix / "state/openclaw"),
+            "configPath": str(self.prefix / "state/openclaw.json"), "role": "gateway", "ownerId": "owned-fixture"}).encode()
+        owner.write_bytes(data)
+        owner.chmod(0o600)
+        self._assert_refusal_preserves_install("Gateway|gateway")
+        self.assertEqual(owner.read_bytes(), data)
+
+    def test_new_template_disables_unrelated_upstream_autonomous_work(self):
+        self.subject.install()
+        config = json.loads((self.prefix / "state/openclaw.json").read_text())
+        self.assertEqual(config.get("agents", {}).get("defaults", {}).get("heartbeat", {}).get("every"), "0m")
+        self.assertEqual(config.get("skills", {}).get("workshop", {}).get("autonomous", {}).get("mode"), "off")
+        self.assertIs(config.get("models", {}).get("catalogRefresh", {}).get("enabled"), False)
+        self.assertIs(config.get("update", {}).get("checkOnStart"), False)
+
+    def test_installed_plugin_launches_the_owned_worker_lifetime_entrypoint(self):
+        self.subject.install()
+        config = json.loads((self.prefix / "state/openclaw.json").read_text())
+        self.assertEqual(config["plugins"]["entries"]["ai-secretary"]["config"].get("workerExecutable"),
+                         str(self.prefix / "managed/bin/ai-secretary-worker"))
+
+    def test_scheduled_python_entrypoint_holds_shared_runtime_ownership(self):
+        self.subject.install()
+        executable = self.prefix / "managed/bin/ai-secretary-python"
+        self.assertTrue(executable.is_file(), "scheduled interpreter bypasses the runtime lifetime entrypoint")
+        child = subprocess.Popen([executable, "-c", "import time; print('ready',flush=True); time.sleep(20)"],
+                                 stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+            self._assert_refusal_preserves_install("runtime|client")
+        finally:
+            child.terminate()
+            child.communicate(timeout=5)
 
     def test_install_is_discoverable_in_the_actual_ghost_alice_registry(self):
         self.subject.install()

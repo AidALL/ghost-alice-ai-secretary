@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import argparse
 import base64
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from datetime import datetime, timezone
 import hashlib
+import fcntl
 import importlib
 import json
 import os
@@ -20,6 +21,8 @@ import platform
 import secrets
 import shlex
 import shutil
+import sqlite3
+import stat
 import subprocess
 import sys
 import tarfile
@@ -36,7 +39,7 @@ NODE_VERSION = "24.21.0"
 SCHEMA_VERSION = 2
 SOURCE_PARTS = ("src", "native", "scripts/build_native.sh", "scripts/installer.py", "openclaw-plugin", "addons", "addons-manifest.json", "pyproject.toml", "README.md", "README_ko.md", "LICENSE", "NOTICE", "ARCHITECTURE.md", "THIRD_PARTY_NOTICES.md")
 REGISTRY_PLATFORMS = ("codex", "claude")
-IGNORED = {"__pycache__", ".DS_Store", ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+IGNORED = {"__pycache__", ".DS_Store", ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".build", ".swiftpm"}
 _FRAMEWORK_PUBLISH_LOCK = threading.RLock()
 
 
@@ -135,7 +138,7 @@ def _copy(source, destination):
 
 
 class Installer:
-    def __init__(self, prefix, skills_dirs, source, ghost_root, *, registry_dir=None, platform_registries=None, openclaw_source=None, node_source=None):
+    def __init__(self, prefix, skills_dirs, source, ghost_root, *, registry_dir=None, platform_registries=None, openclaw_source=None, node_source=None, native_backend="builtin"):
         # Do not resolve an existing prefix symlink into an unrelated directory.
         absolute_prefix = Path(os.path.abspath(Path(prefix).expanduser()))
         self.prefix = absolute_prefix.parent.resolve() / absolute_prefix.name
@@ -167,6 +170,9 @@ class Installer:
         self.ghost_root = Path(ghost_root).expanduser().resolve()
         self.openclaw_source = Path(openclaw_source).expanduser().resolve() if openclaw_source else None
         self.node_source = Path(node_source).expanduser().resolve() if node_source else None
+        if native_backend not in ("builtin", "peekaboo"):
+            raise InstallError("native backend must be builtin or peekaboo")
+        self.native_backend = native_backend
         self.lock_path = self.prefix.parent / ("." + self.prefix.name + ".install.lock")
         self.manifest_path = self.prefix / "install-manifest.json"
         self.journal_path = self.prefix / ".install-journal.json"
@@ -252,7 +258,7 @@ class Installer:
                 pass
 
     @contextmanager
-    def _lock(self):
+    def _lock(self, *, runtime_guard=False):
         self._safe_paths()
         with self._one_lock(self.lock_path):
             # Same-addon installs at different prefixes share this lock. Other
@@ -260,8 +266,127 @@ class Installer:
             with ExitStack() as locks:
                 for directory in sorted(self._registries().values(), key=str):
                     locks.enter_context(self._one_lock(directory / ".ai-secretary.install.lock"))
-                self._recover()
+                if runtime_guard:
+                    locks.enter_context(self._runtime_guard())
+                    self._recover()
+                elif self.journal_path.exists():
+                    with self._runtime_guard():
+                        self._recover()
                 yield
+
+    @staticmethod
+    def _private_file(path):
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            metadata = os.fstat(descriptor)
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(metadata.st_mode) & 0o077):
+                raise InstallError(f"runtime authority file must be owned and private: {path}")
+        finally:
+            os.close(descriptor)
+
+    @contextmanager
+    def _runtime_guard(self):
+        """Retain real process ownership through every destructive mutation.
+
+        Stable lock files live in mutable state and are never replaced, unlinked
+        or explicitly unlocked. An inherited open description remains protected
+        after its original parent exits.
+        """
+        self._check_state_paths()
+        directory = self.prefix / "state/secretary"
+        with ExitStack() as retained:
+            if directory.exists():
+                parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                retained.callback(os.close, parent)
+                metadata = os.fstat(parent)
+                if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+                    raise InstallError("runtime authority directory must be owned and mode 700")
+                for name, actor in (("runtime-use.lock", "runtime client"),
+                                    ("desktop-dispatch.lock", "desktop ownership"),
+                                    ("scheduler-projection.lock", "scheduler producer")):
+                    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+                    try:
+                        descriptor = os.open(name, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent)
+                        os.fchmod(descriptor, 0o600)
+                    except FileExistsError:
+                        descriptor = os.open(name, flags, dir_fd=parent)
+                    retained.callback(os.close, descriptor)
+                    metadata = os.fstat(descriptor)
+                    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                            or stat.S_IMODE(metadata.st_mode) != 0o600):
+                        raise InstallError(f"private {actor} lock is unverifiable; preserve it: {name}")
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError as exc:
+                        raise InstallError(f"active {actor}; stop owned clients, run ai-secretary stop and ai-secretary schedule stop before retrying") from exc
+                self._check_database_quiescence(directory / "operations.sqlite")
+            self._check_gateway_owners()
+            yield
+
+    def _check_database_quiescence(self, path):
+        if not _exists(path):
+            return
+        try:
+            self._private_file(path)
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1, isolation_level=None)) as db:
+                db.execute("PRAGMA query_only=ON")
+                db.execute("BEGIN")
+                tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                checks = (
+                    ("operations", "state='Applying'", "Applying operation; run ai-secretary stop"),
+                    ("worker_sessions", "state='Active'", "active worker; run ai-secretary stop"),
+                    ("execution_contexts", "state IN('Active','Draining')", "active execution authority; run ai-secretary stop"),
+                    ("execution_lifecycle", "enabled<>0 OR status<>'Stopped'", "running execution lifecycle; run ai-secretary stop and ai-secretary schedule stop"),
+                    ("scheduler_outbox", "phase<>'Removed'", "unresolved scheduler obligation; run ai-secretary schedule stop"),
+                    ("scheduler_producers", "state IN('Creating','Unknown')", "unresolved scheduler producer; run ai-secretary schedule stop; an uncertain create must be accounted before removal"),
+                )
+                for table, predicate, message in checks:
+                    if table in tables and db.execute(f"SELECT 1 FROM {table} WHERE {predicate} LIMIT 1").fetchone():
+                        raise InstallError(message)
+                authority = {"authority_schema_version", "execution_lifecycle", "execution_contexts", "execution_operations",
+                    "source_guard", "authority_sources", "collection_grants", "authority_runs", "authority_retrievals"}
+                if tables & authority:
+                    if not authority <= tables or db.execute("SELECT version FROM authority_schema_version").fetchall() != [(1,)]:
+                        raise InstallError("partial or unsupported authority schema; preserve state for review")
+                    if "worker_sessions" in tables and "execution_admissions" not in tables:
+                        raise InstallError("worker authority schema is incomplete; preserve state for review")
+                elif "worker_sessions" in tables:
+                    raise InstallError("worker authority schema is incomplete; preserve state for review")
+                scheduler = {"scheduled_jobs", "scheduled_occurrences", "scheduler_outbox", "scheduler_producers"}
+                if tables & scheduler and not scheduler <= tables:
+                    raise InstallError("partial scheduler authority schema; preserve state for review")
+                db.rollback()
+        except (sqlite3.Error, OSError) as exc:
+            raise InstallError("runtime authority database cannot be verified; preserve state before retrying") from exc
+
+    def _check_gateway_owners(self):
+        """Inspect only this install's pinned state-local ownership records."""
+        state = self.prefix / "state/openclaw"
+        directory = state / "tmp" / ("openclaw-" + str(os.getuid()))
+        if not _exists(directory):
+            return
+        for path in (directory, directory.parent):
+            if path.is_symlink() or not path.is_dir():
+                raise InstallError("Gateway owner directory is unverifiable; preserve it for review")
+        records = [directory / "gateway.state.lock", directory / ("gateway." + hashlib.sha256(str(self.prefix / "state/openclaw.json").encode()).hexdigest()[:8] + ".lock"),
+            directory / ("state." + hashlib.sha256(str(state / "state/openclaw.sqlite").encode()).hexdigest()[:16] + ".lock")]
+        for record in records:
+            if not _exists(record):
+                continue
+            try:
+                self._private_file(record)
+                payload = _json_object(record, "Gateway owner record")
+                pid = payload.get("pid")
+                if type(pid) is not int or pid <= 0 or payload.get("stateDir") != str(state):
+                    raise InstallError("Gateway ownership is unverifiable; preserve its state and stop the original client before retrying")
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    continue
+                raise InstallError("Gateway or state client is still active; stop it through its original terminal or service manager before retrying")
+            except (ValueError, OSError) as exc:
+                raise InstallError("Gateway ownership cannot be verified; preserve the record and stop the original client before retrying") from exc
 
     def _allowed_move(self, path, journal):
         raw = str(path)
@@ -449,15 +574,22 @@ class Installer:
         for path in [state, state / "secretary", state / "ghost-alice", state / "openclaw"]:
             if path.is_symlink() or (_exists(path) and not path.is_dir()):
                 raise InstallError(f"private state path is not a real directory: {path}")
-        for path in [state / "gateway.token", state / "openclaw.json"]:
+        for path in [state / "gateway.token", state / "openclaw.json", state / "secretary/runtime.json"]:
             if path.is_symlink() or (_exists(path) and not path.is_file()):
                 raise InstallError(f"private state file is not a regular file: {path}")
+        runtime = state / "secretary/runtime.json"
+        if runtime.exists():
+            self._private_file(runtime)
 
-    def _initialize_state(self, config_template):
+    def _prepare_state_directories(self):
         self._check_state_paths()
         state = self.prefix / "state"
         for directory in [state, state / "secretary", state / "ghost-alice", state / "openclaw"]:
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def _initialize_state(self, config_template, runtime_template):
+        self._prepare_state_directories()
+        state = self.prefix / "state"
         token_path = state / "gateway.token"
         if not token_path.exists():
             fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -465,13 +597,28 @@ class Installer:
                 stream.write(secrets.token_hex(32) + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-        config_path = state / "openclaw.json"
-        if not config_path.exists():
-            fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(Path(config_template).read_bytes())
-                stream.flush()
-                os.fsync(stream.fileno())
+        for config_path, template in ((state / "openclaw.json", config_template),
+                                      (state / "secretary/runtime.json", runtime_template)):
+            if not config_path.exists():
+                fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(Path(template).read_bytes())
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+    def _packaged_backends(self):
+        required = {"builtin", self.native_backend}
+        configuration = self.prefix / "state/secretary/runtime.json"
+        if configuration.exists():
+            try:
+                runtime = _json_object(configuration, "private runtime configuration")
+            except (ValueError, OSError) as exc:
+                raise InstallError("private runtime configuration cannot be verified; preserve its bytes for review") from exc
+            selected = runtime.get("native_backend", "builtin")
+            if selected not in ("builtin", "peekaboo"):
+                raise InstallError("private runtime configuration selects an unsupported native backend; preserve it for review")
+            required.add(selected)
+        return sorted(required)
 
     def _provision_node(self, target):
         candidate = self.node_source
@@ -613,11 +760,12 @@ class Installer:
         state = self.prefix / "state"
         python = str(Path(sys.executable).resolve())
         node = str(final / "node/bin/node")
+        native = str(final / "app/build" / ("desktop-secretary-peekaboo" if self.native_backend == "peekaboo" else "desktop-secretary"))
         common = {
             "PYTHONPATH": str(final / "app/src"), "PYTHONDONTWRITEBYTECODE": "1",
             "SECRETARY_STATE_DIR": str(state / "secretary"),
             "SECRETARY_GA_LEDGER_ROOT": str(state / "ghost-alice"),
-            "SECRETARY_NATIVE_BINARY": str(final / "app/build/desktop-secretary"),
+            "SECRETARY_NATIVE_BINARY": native,
             "SECRETARY_GHOST_ROOT": str(self.ghost_root), "SECRETARY_NODE": node,
             "SECRETARY_OPENCLAW_BINARY": str(final / "bin/openclaw"),
             "OPENCLAW_STATE_DIR": str(state / "openclaw"),
@@ -627,31 +775,59 @@ class Installer:
         exports = "\n".join("export " + key + "=" + shlex.quote(value) for key, value in common.items())
         exports += "\nexport PATH=" + shlex.quote(str(final / "node/bin")) + ':"$PATH"'
         exports += '\nexport OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN:-$(cat ' + shlex.quote(str(state / "gateway.token")) + ')}"'
+        # The inherited shared descriptor protects every owned runtime process,
+        # including a Gateway with no jobs and a CLI before authority bootstrap.
+        lifetime = """import fcntl,os,stat,sys
+parent=os.open(os.path.dirname(sys.argv[1]),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+metadata=os.fstat(parent)
+if metadata.st_uid!=os.getuid() or stat.S_IMODE(metadata.st_mode)!=0o700: raise RuntimeError('runtime authority directory must be owned and mode 700')
+flags=os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK
+try:
+ fd=os.open(os.path.basename(sys.argv[1]),flags|os.O_CREAT|os.O_EXCL,0o600,dir_fd=parent)
+ os.fchmod(fd,0o600)
+except FileExistsError:
+ fd=os.open(os.path.basename(sys.argv[1]),flags,dir_fd=parent)
+metadata=os.fstat(fd)
+if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid!=os.getuid() or stat.S_IMODE(metadata.st_mode)!=0o600: raise RuntimeError('runtime lifetime lock must be owned and mode 600')
+fcntl.flock(fd,fcntl.LOCK_SH)
+current=os.stat(os.path.basename(sys.argv[1]),dir_fd=parent,follow_symlinks=False)
+if (metadata.st_dev,metadata.st_ino)!=(current.st_dev,current.st_ino): raise RuntimeError('runtime lifetime lock identity changed')
+os.close(parent)
+os.set_inheritable(fd,True)
+os.execvpe(sys.argv[2],sys.argv[2:],os.environ)
+"""
         for name, command in {
             "ai-secretary": [python, "-m", "ai_secretary.control"],
             "ai-secretary-worker": [python, "-m", "ai_secretary.service"],
+            "ai-secretary-python": [python],
             "openclaw": [node, str(final / "openclaw/node_modules/openclaw/openclaw.mjs")],
         }.items():
             path = managed / "bin" / name
-            path.write_text("#!/bin/sh\nset -eu\n" + exports + "\nexec " + shlex.join(command) + ' "$@"\n')
+            guarded_command = [python, "-c", lifetime, str(state / "secretary/runtime-use.lock"), *command]
+            path.write_text("#!/bin/sh\nset -eu\n" + exports + "\nexec " + shlex.join(guarded_command) + ' "$@"\n')
             path.chmod(0o755)
         plugin_config = {"python": python, "source": str(final / "app/src"),
-            "nativeBinary": str(final / "app/build/desktop-secretary"), "stateDir": str(state / "secretary"),
+            "nativeBinary": native, "stateDir": str(state / "secretary"),
+            "workerExecutable": str(final / "bin/ai-secretary-worker"),
             "ghostRoot": str(self.ghost_root), "gaLedgerRoot": str(state / "ghost-alice"), "node": node}
         config = {"gateway": {"mode": "local", "bind": "loopback", "auth": {"mode": "token"}},
             "channels": {}, "logging": {"file": str(state / "openclaw/gateway.log")},
-            "skills": {"load": {"extraDirs": [str(final / "app/addons/ai-secretary")]}},
+            "skills": {"load": {"extraDirs": [str(final / "app/addons/ai-secretary")]}, "workshop": {"autonomous": {"mode": "off"}}},
             "plugins": {"allow": ["ai-secretary"], "load": {"paths": [str(final / "app/openclaw-plugin")]},
                 "slots": {"memory": "none"},
                 "entries": {"ai-secretary": {"enabled": True, "config": plugin_config,
                     "hooks": {"allowConversationAccess": True, "allowPromptInjection": True}}}},
-            "agents": {"defaults": {"model": {"primary": "ollama/qwen3-vl:8b"}}},
-            "models": {"providers": {"ollama": {"baseUrl": "http://127.0.0.1:11434", "apiKey": "ollama-local", "api": "ollama",
+            "agents": {"defaults": {"model": {"primary": "ollama/qwen3-vl:8b"}, "heartbeat": {"every": "0m"}}},
+            "update": {"checkOnStart": False},
+            "models": {"catalogRefresh": {"enabled": False}, "providers": {"ollama": {"baseUrl": "http://127.0.0.1:11434", "apiKey": "ollama-local", "api": "ollama",
                 "models": [{"id": "qwen3-vl:8b", "name": "Qwen3 VL 8B", "input": ["text", "image"], "reasoning": False,
                     "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 32768, "maxTokens": 8192}]}}},
             "tools": {"allow": ["secretary_*"], "deny": ["exec", "process", "read", "write", "edit", "apply_patch", "browser", "message"],
                 "media": {kind: {"enabled": False} for kind in ("image", "audio", "video")}}}
         _json_write(managed / "config/openclaw.json", config)
+        _json_write(managed / "config/runtime.json", {"native_backend": self.native_backend, "native_binary": native,
+            "python_executable": str(final / "bin/ai-secretary-python"), "openclaw_executable": str(final / "bin/openclaw"),
+            "openclaw_state": str(state / "openclaw"), "openclaw_config": str(state / "openclaw.json")})
 
     def _publish(self, targets, work_root):
         # The generic skill transaction excludes node_modules. Our managed
@@ -722,14 +898,21 @@ class Installer:
                 raise InstallError("source must declare exactly the ai-secretary addon skill")
             fingerprint = self._source_fingerprint()
             installer_fingerprint = _hash(Path(__file__))
+            packaged_backends = self._packaged_backends()
             if (previous and previous["schema_version"] == SCHEMA_VERSION and previous.get("source_fingerprint") == fingerprint
                     and previous.get("installer_fingerprint") == installer_fingerprint
                     and previous.get("source") == str(self.source)
                     and previous.get("ghost_root") == str(self.ghost_root)
                     and previous.get("node_version") == NODE_VERSION
                     and previous.get("openclaw_version") == OPENCLAW_VERSION
-                    and previous.get("openclaw_integrity") == OPENCLAW_INTEGRITY):
-                self._initialize_state(self.prefix / "managed/config/openclaw.json")
+                    and previous.get("openclaw_integrity") == OPENCLAW_INTEGRITY
+                    and previous.get("native_backend", "builtin") == self.native_backend
+                    and previous.get("packaged_backends", ["builtin"]) == packaged_backends):
+                needed_state = (self.prefix / "state/gateway.token", self.prefix / "state/openclaw.json", self.prefix / "state/secretary/runtime.json")
+                if not all(path.exists() for path in needed_state):
+                    self._prepare_state_directories()
+                    with self._runtime_guard():
+                        self._initialize_state(self.prefix / "managed/config/openclaw.json", self.prefix / "managed/config/runtime.json")
                 return {"status": "unchanged", "prefix": str(self.prefix), "openclaw_version": OPENCLAW_VERSION,
                     "registry_dir": str(self.registry_dir)}
             self.prefix.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -743,10 +926,15 @@ class Installer:
                 app.mkdir()
                 for part in SOURCE_PARTS:
                     _copy(self.source / part, app / part)
-                _run(["/bin/sh", app / "scripts/build_native.sh"], cwd=app)
+                _run(["/bin/sh", app / "scripts/build_native.sh", "--backend", "all" if "peekaboo" in packaged_backends else "builtin",
+                    "--output-dir", app / "build", "--scratch-path", work_root / "native-build", "--cache-path", work_root / "native-cache"], cwd=app)
                 if not (app / "build/desktop-secretary").is_file():
                     raise InstallError("native build did not produce build/desktop-secretary")
+                if "peekaboo" in packaged_backends and not (app / "build/desktop-secretary-peekaboo").is_file():
+                    raise InstallError("selected peekaboo native build did not produce build/desktop-secretary-peekaboo; no backend fallback was published")
                 shutil.rmtree(app / "build/TestWindow.app", ignore_errors=True)
+                shutil.rmtree(work_root / "native-build", ignore_errors=True)
+                shutil.rmtree(work_root / "native-cache", ignore_errors=True)
                 legacy_plugin_alias = bool(previous and (previous["schema_version"] == 1 or previous.get("legacy_plugin_alias")))
                 if legacy_plugin_alias:
                     # Preserve old mutable config references without keeping a
@@ -775,7 +963,7 @@ class Installer:
                 provided.append({"kind": "resource", "name": "ai-secretary-runtime", "target": str(self.prefix / "managed"),
                     "ownership": "addon", "install_mode": "copy", "content_hash": framework.addon.hash_utils.hash_target(managed, "copy"),
                     "marker": "ai-secretary", "metadata": {"private_prefix": str(self.prefix),
-                        "entrypoints": {name: str(self.prefix / "managed/bin" / name) for name in ("ai-secretary", "ai-secretary-worker", "openclaw")},
+                        "entrypoints": {name: str(self.prefix / "managed/bin" / name) for name in ("ai-secretary", "ai-secretary-worker", "ai-secretary-python", "openclaw")},
                         "uninstaller": uninstaller, "removal_policy": "ai-secretary-owned-manifest",
                         "ownership_inventory": str(self.manifest_path)}})
                 installed_at = datetime.now(timezone.utc).isoformat()
@@ -795,7 +983,8 @@ class Installer:
                     "installer_fingerprint": installer_fingerprint, "ghost_root": str(self.ghost_root),
                     "openclaw_version": OPENCLAW_VERSION, "openclaw_integrity": OPENCLAW_INTEGRITY,
                     "node_version": NODE_VERSION, "resources": resources, "state_dir": str(self.prefix / "state"),
-                    "registry_dir": str(self.registry_dir), "legacy_plugin_alias": legacy_plugin_alias}
+                    "registry_dir": str(self.registry_dir), "legacy_plugin_alias": legacy_plugin_alias,
+                    "native_backend": self.native_backend, "packaged_backends": packaged_backends}
                 if self._typed_registries:
                     manifest["platform_registries"] = self._registry_map()
                 staged_manifest = work_root / "install-manifest.json"
@@ -803,10 +992,14 @@ class Installer:
                 # Recheck ownership immediately before replacing resources.
                 if self._source_fingerprint() != fingerprint:
                     raise InstallError("source changed during staging; previous install is retained, retry from stable sources")
-                self._preflight(previous)
-                self._initialize_state(managed / "config/openclaw.json")
-                self._publish([(managed, self.prefix / "managed"), *skill_sources,
-                    *[(src, dest) for _, src, dest in sidecar_sources], (staged_manifest, self.manifest_path)], work_root)
+                self._prepare_state_directories()
+                with self._runtime_guard():
+                    self._preflight(previous)
+                    if self._packaged_backends() != packaged_backends:
+                        raise InstallError("native runtime selection changed during staging; preserve the current install and retry")
+                    self._initialize_state(managed / "config/openclaw.json", managed / "config/runtime.json")
+                    self._publish([(managed, self.prefix / "managed"), *skill_sources,
+                        *[(src, dest) for _, src, dest in sidecar_sources], (staged_manifest, self.manifest_path)], work_root)
                 return {"status": "installed", "prefix": str(self.prefix), "openclaw_version": OPENCLAW_VERSION,
                     "bin": str(self.prefix / "managed/bin"), "state_dir": str(self.prefix / "state"), "registry_dir": str(self.registry_dir)}
             finally:
@@ -827,7 +1020,7 @@ class Installer:
                 "state_dir": str(self.prefix / "state"), "model_status": "not-checked", "accessibility_status": "not-checked"}
 
     def uninstall(self):
-        with self._lock():
+        with self._lock(runtime_guard=True):
             manifest = self._manifest()
             if not manifest:
                 return {"status": "not-installed", "preserved": [], "prefix": str(self.prefix)}
@@ -914,6 +1107,8 @@ def main(argv=None):
     parser.add_argument("--ghost-alice-root", type=Path, default=Path(os.environ.get("SECRETARY_GHOST_ROOT", str(Path.home() / "ghost-alice"))))
     parser.add_argument("--openclaw-source", type=Path, help="existing npm prefix containing the exact pinned package and package-lock.json")
     parser.add_argument("--node-source", type=Path, help="local Node 24.21.0 distribution root")
+    parser.add_argument("--native-backend", choices=("builtin", "peekaboo"), default="builtin",
+        help="compile the selected backend explicitly; peekaboo also retains the independent builtin product")
     args = parser.parse_args(argv)
     skills = args.skills_dir or [Path.home() / ".agents/skills"]
     if args.claude:
@@ -934,7 +1129,7 @@ def main(argv=None):
         registry_dir = args.registry_dir if args.registry_dir is not None else None if platform_registries is not None else Path.home() / ".ghost-alice/addons"
         installer = Installer(args.prefix, skills, args.source, args.ghost_alice_root,
             registry_dir=registry_dir, platform_registries=platform_registries,
-            openclaw_source=args.openclaw_source, node_source=args.node_source)
+            openclaw_source=args.openclaw_source, node_source=args.node_source, native_backend=args.native_backend)
         result = getattr(installer, args.command)()
     except (InstallError, OSError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}), file=sys.stderr)

@@ -79,7 +79,7 @@
         },
         "content": {
           "type": "object",
-          "description": "Actual sender account, recipients, body, attachment content hashes and invite details; shown to the user for approval."
+          "description": "Actual sender account, recipients, body, attachment content hashes, invite details, exact composer identity (pid/process_start/window_id), and intent; shown to the USER as sender for approval."
         }
       },
       "required": [
@@ -169,6 +169,10 @@
         "outbound": {
           "type": "object",
           "description": "Exact user-approved draft_id and content, required at outgoing commit."
+        },
+        "element_ref": {
+          "type": "string",
+          "description": "Opaque reference from a fresh observed actionable element."
         }
       },
       "required": [
@@ -176,6 +180,57 @@
         "action",
         "expected"
       ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "secretary_collect",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "secretary_ingest",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string"
+        },
+        "retrieval_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "retrieval_id",
+        "path"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "secretary_artifacts",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string"
+        }
+      },
+      "required": [],
       "additionalProperties": false
     }
   }

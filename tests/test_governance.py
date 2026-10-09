@@ -26,6 +26,7 @@ class GovernanceTests(unittest.IsolatedAsyncioTestCase):
         gate = await self.g.check("s")
         self.assertEqual(gate["decision"], "allow")
         self.assertEqual(gate["task_id"], one["task_id"])
+        self.assertEqual(gate["admission_id"], "native-1")
 
     async def test_classification_cannot_be_missing_or_delegated(self):
         for origin in ("unknown", "internal_system", "inter_session"):
@@ -40,6 +41,27 @@ class GovernanceTests(unittest.IsolatedAsyncioTestCase):
         latest = self.g.intake("s", "b", "task b", "external_user")
         with self.assertRaises(PermissionError): self.g.intake("s", "a", "task a", "external_user")
         self.assertEqual((await self.g.check("s"))["task_id"], latest["task_id"])
+
+    async def test_new_input_invalidates_old_native_context(self):
+        from ai_secretary.authority import AuthorityStore
+        from ai_secretary.coordinator import RunCoordinator
+        self.g.intake("s", "a", "Prepare local work", "external_user")
+        store = AuthorityStore(self.root / "operations.sqlite")
+        context = await RunCoordinator(store, self.g.check).begin_foreground("s")
+        self.g.intake("s", "b", "Use the updated instruction", "external_user")
+        with store.read() as db:
+            self.assertEqual(db.execute("SELECT state FROM execution_contexts WHERE run_id=?", (context.run_id,)).fetchone()[0], "Draining")
+
+    async def test_current_legacy_admission_is_migrated_without_new_intake(self):
+        from ai_secretary.authority import AuthorityStore
+        from ai_secretary.coordinator import RunCoordinator
+        self.g.intake("s", "a", "Current admitted work", "external_user")
+        store = AuthorityStore(self.root / "operations.sqlite")
+        with store.transaction() as uow:
+            uow.connection.execute("DROP TABLE execution_admissions")
+        migrated = Governance(self.root)
+        context = await RunCoordinator(store, migrated.check).begin_foreground("s")
+        self.assertEqual(context.admission_id, "a")
 
     async def test_continuation_preserves_task_and_approved_draft(self):
         from ai_secretary.ledger import Ledger

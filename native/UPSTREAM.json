@@ -1,0 +1,43 @@
+{
+  "peekaboo_version": "4.6.0",
+  "peekaboo_revision": "b54551ce2d0013e52c2a405bfeabced88ec5c2e0",
+  "openclaw_revision": "fc23bc864e4553c2d215e479eeec47b67a0bf943",
+  "products": [
+    "PeekabooAutomationKit",
+    "PeekabooFoundation"
+  ],
+  "patch_sha256": "af3c47091740d30d03ab19923522d140138484058df896d50c5bb4561addb531",
+  "source_manifest_sha256": "e0f5f0cc6c2700aacca347c94e82a1ea1fd49f4bde87ebf7c18b518e75f972f2",
+  "licenses": [
+    {
+      "package": "Peekaboo",
+      "path": "Notices/Peekaboo.txt",
+      "sha256": "62316704df7426e5a79d2827ff8aca36e9abb3a73b8e68557030749ebefec667"
+    },
+    {
+      "package": "AXorcist",
+      "path": "Notices/AXorcist.txt",
+      "sha256": "62316704df7426e5a79d2827ff8aca36e9abb3a73b8e68557030749ebefec667"
+    },
+    {
+      "package": "swift-log",
+      "path": "Notices/swift-log.txt",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "package": "swift-algorithms",
+      "path": "Notices/swift-algorithms.txt",
+      "sha256": "770af8291f708538d8ff885a0bbc4e045cd700531741c4f99528d435c14d7f55"
+    },
+    {
+      "package": "swift-numerics",
+      "path": "Notices/swift-numerics.txt",
+      "sha256": "770af8291f708538d8ff885a0bbc4e045cd700531741c4f99528d435c14d7f55"
+    },
+    {
+      "package": "Commander",
+      "path": "Notices/Commander.txt",
+      "sha256": "14293556b79940745123d0160c71d27ed0e9fe9b8a848093f3ed78f4853caafe"
+    }
+  ]
+}

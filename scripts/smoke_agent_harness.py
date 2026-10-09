@@ -259,6 +259,17 @@ def main():
                         process.wait(timeout=3)
                     report["exit_code"] = process.returncode
             report["cell_finished_at"] = utc()
+            operations = root / "worker/operations.sqlite"
+            if args.admission_mode == "user-run" and operations.exists():
+                deadline = time.monotonic() + 3
+                while True:
+                    with sqlite3.connect(operations) as db:
+                        db.row_factory = sqlite3.Row
+                        report["worker_lifetimes"] = [dict(row) for row in db.execute("SELECT worker_sessions.state AS worker_state,execution_contexts.state AS context_state,lifecycle_id FROM worker_sessions JOIN execution_contexts USING(run_id)")]
+                        report["execution_lifetimes"] = [dict(row) for row in db.execute("SELECT lifecycle_id,status,enabled FROM execution_lifecycle")]
+                    if all(row["status"] == "Stopped" for row in report["execution_lifetimes"]) or time.monotonic() > deadline:
+                        break
+                    time.sleep(.05)
             if args.admission_mode == "user-run":
                 with sqlite3.connect(root / "worker/control-sessions.sqlite") as db:
                     db.row_factory = sqlite3.Row
@@ -319,6 +330,10 @@ def main():
                     report["checks"]["production_USER_run_command"] = report["command"][2:4] == ["ai_secretary.control", "--session"] and "run" in report["command"]
                     report["required_checks"].append("production_USER_run_command")
                     complete = complete and report["checks"]["production_USER_run_command"]
+                    lifetimes = report.get("execution_lifetimes", [])
+                    report["checks"]["bound_worker_lifecycle_drained"] = bool(lifetimes) and all(row["status"] == "Stopped" and row["enabled"] == 0 for row in lifetimes)
+                    report["required_checks"].append("bound_worker_lifecycle_drained")
+                    complete = complete and report["checks"]["bound_worker_lifecycle_drained"]
             report["status"] = "Passed" if complete else "Failed" if prompts or chats else "Inconclusive"
             report["fail_closed_observation"] = bool(prompts) and not provenance_ok and not admissions and not native_status
             report["boundary_verdicts"] = {

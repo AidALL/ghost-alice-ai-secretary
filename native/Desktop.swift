@@ -4,18 +4,12 @@ import CryptoKit
 import Darwin
 import ScreenCaptureKit
 
-struct DesktopError: Error {
-    let code: String
-    let message: String
-}
-
 var effectStarted = false
+var activeAuthorization: DispatchAuthorization?
+var backendOutcome: [String: Any]?
+var effectStatusOverride: String?
 let maximumObservationAge: Double = 10
 let coordinateSpace = "quartz_global_top_left"
-
-func fail(_ code: String, _ message: String) throws -> Never {
-    throw DesktopError(code: code, message: message)
-}
 
 func number(_ object: [String: Any], _ name: String) throws -> Double {
     guard let value = object[name] as? NSNumber,
@@ -122,14 +116,47 @@ func signingData(_ observation: [String: Any]) throws -> Data {
     return try JSONSerialization.data(withJSONObject: values, options: [.sortedKeys])
 }
 
-func observation(_ request: [String: Any], pid: pid_t, window: [String: Any]) throws -> [String: Any] {
-    var values: [String: Any] = ["pid": pid, "process_start": try processStart(pid),
+func observation(_ request: [String: Any], pid: pid_t, processGeneration: String,
+                 window: [String: Any], selectors: [String: Any]?) throws -> [String: Any] {
+    var values: [String: Any] = ["pid": pid, "process_start": processGeneration,
         "window_id": window[kCGWindowNumber as String] ?? 0,
         "geometry": geometry(windowRectangle(window)!), "observed_at": Date().timeIntervalSince1970,
         "coordinate_space": coordinateSpace]
+    values["backend"] = nativeBackend
+    if let selectors { values["selectors"] = selectors }
+    if let activeAuthorization { values["ownership"] = activeAuthorization.observationBinding }
     let signature = HMAC<SHA256>.authenticationCode(for: try signingData(values), using: try key(request))
     values["token"] = signature.map { String(format: "%02x", $0) }.joined()
     return values
+}
+
+@MainActor
+func observeWindowTransaction(
+    windowID: Int?, select: (Int?) throws -> [String: Any], processGeneration: () throws -> String,
+    collect: ([String: Any], String) async throws -> (result: [String: Any], selectors: [String: Any]?),
+    publish: ([String: Any], String, [String: Any], [String: Any]?) throws -> [String: Any]) async throws -> [String: Any] {
+    let initialGeneration = try processGeneration()
+    let window = try select(windowID)
+    guard let initialID = (window[kCGWindowNumber as String] as? NSNumber)?.intValue, initialID > 0 else {
+        try fail("snapshot_inconsistent", "initial window identity is absent")
+    }
+    let collected = try await collect(window, initialGeneration)
+    let current = try select(initialID)
+    guard (current[kCGWindowNumber as String] as? NSNumber)?.intValue == initialID,
+          (current[kCGWindowOwnerPID as String] as? NSNumber)?.intValue == (window[kCGWindowOwnerPID as String] as? NSNumber)?.intValue,
+          let before = windowRectangle(window), let after = windowRectangle(current), sameRectangle(before, after),
+          let described = collected.result["window"] as? [String: Any],
+          (described["window_id"] as? NSNumber)?.intValue == initialID else {
+        try fail("snapshot_inconsistent", "window identity or geometry changed during observation; observe again")
+    }
+    if let captured = collected.result["screenshot"] as? [String: Any],
+       (captured["window_id"] as? NSNumber)?.intValue != initialID {
+        try fail("snapshot_inconsistent", "capture does not belong to the initial window")
+    }
+    guard try processGeneration() == initialGeneration else {
+        try fail("process_mismatch", "process generation changed during observation; observe again")
+    }
+    return try publish(current, initialGeneration, collected.result, collected.selectors)
 }
 
 func sameRectangle(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
@@ -154,6 +181,12 @@ func guardObservation(_ request: [String: Any]) throws -> (pid_t, [String: Any],
                                                 using: try key(request)) else {
         try fail("observation_invalid", "observation signature did not verify")
     }
+    guard expected["backend"] as? String == nativeBackend,
+          let binding = expected["ownership"] as? [String: Any], let activeAuthorization,
+          NSDictionary(dictionary: binding).isEqual(to: activeAuthorization.observationBinding) else {
+        try fail("observation_ownership_mismatch", "dispatch observation belongs to another backend, run, attempt or desktop fence")
+    }
+    if let selectors = expected["selectors"] as? [String: Any] { _ = try validateSelectors(selectors) }
     let age = Date().timeIntervalSince1970 - (try number(expected, "observed_at"))
     guard age >= 0, age <= maximumObservationAge else {
         try fail("stale_observation", "observation is older than 10 seconds or from the future")
@@ -186,43 +219,105 @@ func axRectangle(_ element: AXUIElement) -> CGRect? {
     return CGRect(origin: point, size: dimensions)
 }
 
-func axWindow(_ pid: pid_t, _ rect: CGRect) throws -> AXUIElement {
+struct AXWindowCandidate {
+    let windowID: Int?
+    let bounds: CGRect?
+}
+
+func chooseAXWindowIndex(_ candidates: [AXWindowCandidate], windowID: Int, bounds: CGRect) throws -> Int {
+    let matches = candidates.indices.filter { candidates[$0].windowID == windowID }
+    guard !matches.isEmpty else { try fail("ax_window_unavailable", "no AX window maps to the observed window ID") }
+    guard matches.count == 1 else { try fail("ax_window_ambiguous", "multiple AX windows map to the observed window ID") }
+    let index = matches[0]
+    guard candidates[index].bounds.map({ sameRectangle($0, bounds) }) == true else {
+        try fail("ax_window_unavailable", "exact AX window bounds differ from the observed window")
+    }
+    return index
+}
+
+func boundedAXString(_ value: String) -> (value: String, incomplete: Bool) {
+    value.utf8.count <= 4096 ? (value, false) : ("", true)
+}
+
+func extractAXTree<Node>(_ root: Node, readChildren: (Node) -> [Node]?, readNode: (Node) -> [String: Any]) -> [String: Any] {
+    var queue: [(Node, Int, Int?)] = [(root, 0, nil)]
+    var nodes = [[String: Any]]()
+    var incomplete = false
+    while !queue.isEmpty && nodes.count < 250 {
+        let (element, depth, parent) = queue.removeFirst()
+        var node = readNode(element)
+        node["id"] = nodes.count
+        node["depth"] = depth
+        if let parent { node["parent"] = parent }
+        let parentID = nodes.count
+        nodes.append(node)
+        guard let children = readChildren(element) else { incomplete = true; continue }
+        if depth >= 6 {
+            if !children.isEmpty { incomplete = true }
+            continue
+        }
+        let capacity = max(0, 250 - nodes.count - queue.count)
+        let admitted = min(children.count, 250, capacity)
+        if admitted < children.count { incomplete = true }
+        queue.append(contentsOf: children.prefix(admitted).map { ($0, depth + 1, parentID) })
+    }
+    return ["available": true, "nodes": nodes, "truncated": incomplete || !queue.isEmpty]
+}
+
+typealias AXWindowIDFunction = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> Int32
+let axWindowIDSymbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow")
+var axWindowIDBindingAvailable: Bool { axWindowIDSymbol != nil }
+
+func axWindowID(_ element: AXUIElement) -> Int? {
+    guard let symbol = axWindowIDSymbol else { return nil }
+    let resolve = unsafeBitCast(symbol, to: AXWindowIDFunction.self)
+    var windowID: CGWindowID = 0
+    return resolve(element, &windowID) == AXError.success.rawValue && windowID > 0 ? Int(windowID) : nil
+}
+
+func axChildren(_ element: AXUIElement) -> [AXUIElement]? {
+    var value: CFTypeRef?
+    let result = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value)
+    switch result {
+    case .success: return value as? [AXUIElement]
+    case .attributeUnsupported, .noValue: return []
+    default: return nil // A failed/timed-out branch is incomplete, not an empty subtree.
+    }
+}
+
+func axWindow(_ pid: pid_t, _ rect: CGRect, windowID: Int) throws -> AXUIElement {
     guard AXIsProcessTrusted() else { try fail("accessibility_denied", "Accessibility permission is not granted") }
+    guard axWindowIDBindingAvailable else { try fail("ax_window_binding_unavailable", "exact AX window-ID binding is unavailable") }
     let app = AXUIElementCreateApplication(pid)
     AXUIElementSetMessagingTimeout(app, 0.5)
-    guard let entries = attribute(app, kAXWindowsAttribute) as? [AXUIElement],
-          let window = entries.first(where: { element in
-              axRectangle(element).map { sameRectangle($0, rect) } ?? false
-          }) else { try fail("ax_window_unavailable", "could not bind Accessibility window to observed geometry") }
-    return window
+    guard let entries = attribute(app, kAXWindowsAttribute) as? [AXUIElement] else {
+        try fail("ax_window_unavailable", "could not enumerate Accessibility windows")
+    }
+    let candidates = entries.map { AXWindowCandidate(windowID: axWindowID($0), bounds: axRectangle($0)) }
+    return entries[try chooseAXWindowIndex(candidates, windowID: windowID, bounds: rect)]
 }
 
 func axTree(_ root: AXUIElement) -> [String: Any] {
-    var queue: [(AXUIElement, Int, Int?)] = [(root, 0, nil)]
-    var nodes = [[String: Any]]()
-    while !queue.isEmpty && nodes.count < 250 {
-        let (element, depth, parent) = queue.removeFirst()
-        var node: [String: Any] = ["id": nodes.count, "depth": depth]
-        if let parent { node["parent"] = parent }
-        for (name, output) in [(kAXRoleAttribute, "role"), (kAXTitleAttribute, "title"),
+    extractAXTree(root, readChildren: axChildren, readNode: { element in
+        var node: [String: Any] = [:]
+        for (name, output) in [(kAXRoleAttribute, "role"), (kAXIdentifierAttribute, "identifier"), (kAXTitleAttribute, "title"),
                                (kAXDescriptionAttribute, "description"), (kAXValueAttribute, "value"),
                                (kAXEnabledAttribute, "enabled")] {
-            if let value = attribute(element, name) as? String { node[output] = String(value.prefix(4000)) }
+            if let value = attribute(element, name) as? String {
+                let bounded = boundedAXString(value)
+                node[output] = bounded.value
+                if bounded.incomplete { node["selector_incomplete"] = true }
+            }
             else if let value = attribute(element, name) as? NSNumber { node[output] = value }
         }
         if let rect = axRectangle(element) { node["geometry"] = geometry(rect) }
         var actions: CFArray?
         if AXUIElementCopyActionNames(element, &actions) == .success { node["actions"] = actions as? [String] ?? [] }
-        let parentID = nodes.count
-        nodes.append(node)
-        if depth < 6, let children = attribute(element, kAXChildrenAttribute) as? [AXUIElement] {
-            queue.append(contentsOf: children.prefix(250 - nodes.count).map { ($0, depth + 1, parentID) })
-        }
-    }
-    return ["available": true, "nodes": nodes, "truncated": !queue.isEmpty]
+        return node
+    })
 }
 
-func requireKeyboardTarget(_ pid: pid_t, _ rect: CGRect) throws {
+func requireKeyboardTarget(_ pid: pid_t, _ rect: CGRect, windowID: Int) throws {
     guard AXIsProcessTrusted() else { try fail("accessibility_denied", "Accessibility permission is not granted") }
     guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
         try fail("focus_mismatch", "observed application is not frontmost")
@@ -231,6 +326,7 @@ func requireKeyboardTarget(_ pid: pid_t, _ rect: CGRect) throws {
     AXUIElementSetMessagingTimeout(app, 0.5)
     guard let focused = attribute(app, kAXFocusedWindowAttribute),
           CFGetTypeID(focused) == AXUIElementGetTypeID(),
+          axWindowID(focused as! AXUIElement) == windowID,
           let current = axRectangle(focused as! AXUIElement), sameRectangle(current, rect) else {
         try fail("focus_mismatch", "focused window differs from observed window")
     }
@@ -251,6 +347,7 @@ func requirePoint(_ point: CGPoint, _ rect: CGRect, _ window: [String: Any]) thr
 
 func post(_ event: CGEvent?, pid: pid_t? = nil) throws {
     guard let event else { try fail("event_unavailable", "could not create input event") }
+    if !effectStarted { try activeAuthorization?.validateCurrent() }
     effectStarted = true
     if let pid { event.postToPid(pid) }
     else { event.post(tap: .cghidEventTap) }
@@ -280,14 +377,20 @@ final class CaptureResult {
     func current() -> Result<Data, Error>? { lock.lock(); defer { lock.unlock() }; return result }
 }
 
-func screenshot(_ windowID: Int) throws -> Data {
+func screenshot(_ windowID: Int, pid: pid_t, processGeneration: String) throws -> Data {
     guard CGPreflightScreenCaptureAccess() else { try fail("screen_recording_denied", "Screen Recording permission is not granted") }
     let receiver = CaptureResult()
     SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
-        guard let selected = content?.windows.first(where: { $0.windowID == windowID }) else {
+        guard let selected = content?.windows.first(where: { $0.windowID == windowID }),
+              selected.owningApplication?.processID == pid else {
             receiver.complete(.failure(error ?? DesktopError(code: "screenshot_unavailable", message: "window is not capturable")))
             return
         }
+        do {
+            guard try processStart(pid) == processGeneration else {
+                try fail("process_mismatch", "capture target process generation changed")
+            }
+        } catch { receiver.complete(.failure(error)); return }
         let configuration = SCStreamConfiguration()
         configuration.width = max(1, Int(selected.frame.width * 2))
         configuration.height = max(1, Int(selected.frame.height * 2))
@@ -309,13 +412,28 @@ func screenshot(_ windowID: Int) throws -> Data {
     return try outcome.get()
 }
 
-func execute(_ request: [String: Any]) throws -> [String: Any] {
+@MainActor
+func execute(_ request: [String: Any]) async throws -> [String: Any] {
     guard let command = request["command"] as? String else { try fail("invalid_request", "command is required") }
+    if let selected = request["backend"] as? String, selected != nativeBackend {
+        try fail("backend_mismatch", "selected backend is not the running helper; no fallback was attempted")
+    }
+    let isEffect = ["focus", "click", "drag", "scroll", "type", "hotkey", "open"].contains(command)
+    if let envelope = request["_authorization"] {
+        activeAuthorization = try DispatchAuthorization(envelope, key: key(request))
+        try activeAuthorization!.validateCurrent()
+    } else if isEffect {
+        try fail("authorization_required", "effects require server-signed local authority and inherited dispatch ownership")
+    }
     switch command {
     case "status":
         return ["accessibility": AXIsProcessTrusted(), "screen_recording": CGPreflightScreenCaptureAccess(),
                 "permissions_requested": false, "observation_max_age_seconds": maximumObservationAge,
-                "coordinate_space": coordinateSpace, "native_pid": getpid(), "observed_at": Date().timeIntervalSince1970]
+                "coordinate_space": coordinateSpace, "native_pid": getpid(), "observed_at": Date().timeIntervalSince1970,
+                "backend": nativeBackend, "backend_version": nativeBackendVersion,
+                "capabilities": axWindowIDBindingAvailable ? nativeCapabilities : nativeCapabilities.filter { !["selector_click", "focus", "type", "hotkey"].contains($0) },
+                "ax_window_id_binding_available": axWindowIDBindingAvailable, "authorization_contract": "local-sqlite-v1",
+                "selector_schema": selectorSchema, "actual_input_qualified": false]
     case "apps":
         return ["apps": NSWorkspace.shared.runningApplications.map { app -> [String: Any] in
             var value: [String: Any] = ["pid": app.processIdentifier, "name": app.localizedName ?? "",
@@ -332,15 +450,23 @@ func execute(_ request: [String: Any]) throws -> [String: Any] {
         let pid = pid_t(try integer(request, "pid"))
         guard pid > 0 else { try fail("invalid_request", "pid must be positive") }
         let windowID = request["window_id"] == nil ? nil : try integer(request, "window_id")
-        let window = try selectedWindow(pid, windowID)
+        return try await observeWindowTransaction(windowID: windowID,
+          select: { try selectedWindow(pid, $0) }, processGeneration: { try processStart(pid) }, collect: { window, generation in
         var result: [String: Any] = ["window": windowJSON(window)]
+        var selectors: [String: Any]?
         if request["include_ax"] as? Bool ?? true {
-            do { result["ax"] = axTree(try axWindow(pid, windowRectangle(window)!)) }
+            do {
+                let inspection = try await inspectSelectedWindow(pid: pid, window: window)
+                result["ax"] = inspection.ax
+                selectors = inspection.selectors
+            }
             catch let error as DesktopError { result["ax"] = ["available": false, "reason": error.code] }
         }
         if request["screenshot_path"] != nil || request["screenshot_base64"] as? Bool == true {
-            let data = try screenshot((window[kCGWindowNumber as String] as! NSNumber).intValue)
-            var image: [String: Any] = ["format": "png", "bytes": data.count, "window_id": window[kCGWindowNumber as String]!]
+            let data = try screenshot((window[kCGWindowNumber as String] as! NSNumber).intValue,
+                                      pid: pid, processGeneration: generation)
+            var image: [String: Any] = ["format": "png", "bytes": data.count,
+                                      "window_id": window[kCGWindowNumber as String]!, "process_start": generation]
             if let path = request["screenshot_path"] as? String {
                 try saveScreenshot(data, path: path)
                 image["path"] = path
@@ -351,26 +477,35 @@ func execute(_ request: [String: Any]) throws -> [String: Any] {
             }
             result["screenshot"] = image
         }
-        let current = try selectedWindow(pid, windowID)
-        guard sameRectangle(windowRectangle(window)!, windowRectangle(current)!) else {
-            try fail("snapshot_inconsistent", "window changed geometry during observation; observe again")
-        }
-        result["observation"] = try observation(request, pid: pid, window: current)
+        return (result, selectors)
+        }, publish: { current, generation, collected, selectors in
+        var result = collected
+        try activeAuthorization?.validateCurrent()
+        result["observation"] = try observation(request, pid: pid, processGeneration: generation,
+                                                window: current, selectors: selectors)
         return result
+        })
     case "focus", "click", "drag", "scroll", "type", "hotkey", "open":
         let (pid, window, rect) = try guardObservation(request)
+        #if SECRETARY_PEEKABOO
+        if ["click", "type", "hotkey"].contains(command) {
+            return try await executePeekaboo(request, pid: pid, window: window, bounds: rect)
+        }
+        if !["focus", "open"].contains(command) { try fail("backend_unsupported", "selected backend does not implement this effect") }
+        #endif
         switch command {
         case "focus":
-            let ax = try axWindow(pid, rect)
+            let ax = try axWindow(pid, rect, windowID: (window[kCGWindowNumber as String] as! NSNumber).intValue)
             guard let app = NSRunningApplication(processIdentifier: pid) else { try fail("process_unavailable", "application exited") }
+            try activeAuthorization!.validateCurrent()
             effectStarted = true
             guard app.activate(options: []), AXUIElementPerformAction(ax, kAXRaiseAction as CFString) == .success else {
                 try fail("focus_unconfirmed", "application focus could not be confirmed")
             }
-            RunLoop.current.run(until: Date().addingTimeInterval(0.15))
-            try requireKeyboardTarget(pid, rect)
+            try await Task.sleep(nanoseconds: 150_000_000)
+            try requireKeyboardTarget(pid, rect, windowID: (window[kCGWindowNumber as String] as! NSNumber).intValue)
         case "click":
-            let point = CGPoint(x: try number(request, "x"), y: try number(request, "y"))
+            let point = try await selectedClickPoint(request, pid: pid, window: window)
             try requirePoint(point, rect, window)
             let buttonName = request["button"] as? String ?? "left"
             guard ["left", "right"].contains(buttonName) else { try fail("invalid_request", "button must be left or right") }
@@ -412,7 +547,7 @@ func execute(_ request: [String: Any]) throws -> [String: Any] {
             try post(event)
         case "type":
             guard let text = request["text"] as? String, text.utf16.count <= 10000 else { try fail("invalid_request", "text must be a string of at most 10000 UTF-16 units") }
-            try requireKeyboardTarget(pid, rect)
+            try requireKeyboardTarget(pid, rect, windowID: (window[kCGWindowNumber as String] as! NSNumber).intValue)
             let units = Array(text.utf16)
             let source = CGEventSource(stateID: .privateState)
             let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true)
@@ -429,7 +564,7 @@ func execute(_ request: [String: Any]) throws -> [String: Any] {
                 guard let flag = flagMap[modifier] else { try fail("invalid_request", "unsupported modifier") }
                 flags.insert(flag)
             }
-            try requireKeyboardTarget(pid, rect)
+            try requireKeyboardTarget(pid, rect, windowID: (window[kCGWindowNumber as String] as! NSNumber).intValue)
             for down in [true, false] {
                 let event = CGEvent(keyboardEventSource: CGEventSource(stateID: .hidSystemState), virtualKey: code, keyDown: down)
                 event?.flags = flags
@@ -444,6 +579,7 @@ func execute(_ request: [String: Any]) throws -> [String: Any] {
                       ["https", "http"].contains(parsed.scheme?.lowercased() ?? ""), parsed.host != nil {
                 url = parsed
             } else { try fail("invalid_request", "open requires path or http(s) URL") }
+            try activeAuthorization!.validateCurrent()
             effectStarted = true
             guard NSWorkspace.shared.open(url) else { try fail("open_unconfirmed", "workspace did not confirm open request") }
         default: break
@@ -456,7 +592,8 @@ func execute(_ request: [String: Any]) throws -> [String: Any] {
 
 @main
 struct Desktop {
-    static func main() {
+    @MainActor
+    static func main() async {
         var response: [String: Any]
         do {
             var input = Data()
@@ -469,13 +606,16 @@ struct Desktop {
             guard let request = try JSONSerialization.jsonObject(with: input) as? [String: Any] else {
                 try fail("invalid_request", "request must be a JSON object")
             }
-            let result = try execute(request)
-            response = ["ok": true, "result": result, "effect_status": effectStarted ? "dispatched" : "not_started"]
+            let result = try await execute(request)
+            response = ["ok": true, "result": result, "effect_status": effectStatusOverride ?? (effectStarted ? "dispatched" : "not_started")]
         } catch let error as DesktopError {
-            response = ["ok": false, "error": ["code": error.code, "message": error.message], "effect_status": effectStarted ? "unknown" : "not_started"]
+            response = ["ok": false, "error": ["code": error.code, "message": error.message], "effect_status": effectStatusOverride ?? (effectStarted ? "unknown" : "not_started")]
         } catch {
             response = ["ok": false, "error": ["code": "native_error", "message": String(error.localizedDescription.prefix(512))], "effect_status": effectStarted ? "unknown" : "not_started"]
         }
+        if let backendOutcome { response["backend_outcome"] = backendOutcome }
+        // Keep inherited ownership and its duplicate alive until async work is quiescent.
+        withExtendedLifetime(activeAuthorization) {}
         if let data = try? JSONSerialization.data(withJSONObject: response, options: [.sortedKeys]) {
             FileHandle.standardOutput.write(data + Data([10]))
         }

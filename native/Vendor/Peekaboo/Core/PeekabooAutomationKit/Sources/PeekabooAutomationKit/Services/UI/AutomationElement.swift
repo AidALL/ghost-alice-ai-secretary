@@ -1,0 +1,342 @@
+import AppKit
+import ApplicationServices
+import AXorcist
+import CoreGraphics
+import Foundation
+import PeekabooFoundation
+
+/// Testable abstraction over a UI accessibility element.
+///
+/// The production implementation wraps AXorcist's `Element`; tests can provide an in-memory tree with the same
+/// observable attributes and action behavior.
+@MainActor
+protocol AutomationElementRepresenting: Sendable {
+    var name: String? { get }
+    var label: String? { get }
+    var roleDescription: String? { get }
+    var identifier: String? { get }
+    var role: String? { get }
+    var subrole: String? { get }
+    var frame: CGRect? { get }
+    var value: Any? { get }
+    var stringValue: String? { get }
+    var actionNames: [String] { get }
+    var isValueSettable: Bool { get }
+    var isFocusedSettable: Bool { get }
+    var isSelectedSettable: Bool { get }
+    var selectedValue: Bool? { get }
+    var isEnabled: Bool { get }
+    var isFocused: Bool { get }
+    var focusedState: Bool? { get }
+    var isOffscreen: Bool { get }
+    var anchorPoint: CGPoint? { get }
+    var automationChildren: [any AutomationElementRepresenting] { get }
+
+    /// Raw accessibility element for callers that must issue AX calls off the main actor
+    /// (e.g. non-blocking `AXShowMenu`). In-memory test elements return `nil`.
+    var underlyingAXElement: AXUIElement? { get }
+    var focusedElementIdentity: FocusedElementIdentity? { get }
+
+    /// Whether the element advertises `actionName`.
+    ///
+    /// This must query `AXUIElementCopyActionNames` — the dedicated actions API — rather than the
+    /// `AXActionNames` *attribute*. Many elements (notably SwiftUI `AXButton`s) return
+    /// `attributeUnsupported` for the attribute read even though `AXUIElementCopyActionNames`
+    /// reports `AXPress`, so relying on `actionNames` silently rejects pressable elements.
+    func supportsAction(_ actionName: String) -> Bool
+
+    func performAutomationAction(_ actionName: String) throws
+    func setAutomationValue(_ value: UIElementValue) throws
+    func setAutomationFocused(_ focused: Bool) throws
+    func setAutomationSelected(_ selected: Bool) throws
+    func stringAttribute(_ name: String) -> String?
+    func intAttribute(_ name: String) -> Int?
+    func doubleAttribute(_ name: String) -> Double?
+}
+
+extension AutomationElementRepresenting {
+    @MainActor
+    var focusedElementIdentity: FocusedElementIdentity? {
+        nil
+    }
+
+    @MainActor
+    var focusedState: Bool? {
+        self.isFocused
+    }
+}
+
+extension AutomationElementRepresenting {
+    var underlyingAXElement: AXUIElement? {
+        nil
+    }
+
+    func supportsAction(_ actionName: String) -> Bool {
+        self.actionNames.contains(actionName)
+    }
+
+    var isSelectedSettable: Bool {
+        false
+    }
+
+    var selectedValue: Bool? {
+        nil
+    }
+
+    func setAutomationSelected(_: Bool) throws {
+        throw AccessibilitySystemError(.attributeUnsupported)
+    }
+
+    func doubleAttribute(_: String) -> Double? {
+        nil
+    }
+}
+
+/// Typed wrapper around an accessibility element used by action-first input paths.
+struct AutomationElement: AutomationElementRepresenting {
+    let element: Element
+
+    init(_ element: Element) {
+        self.element = element
+    }
+
+    @MainActor
+    var name: String? {
+        self.element.title()
+            ?? self.element.label()
+            ?? self.element.descriptionText()
+            ?? self.element.roleDescription()
+            ?? self.stringValue
+    }
+
+    @MainActor
+    var label: String? {
+        self.element.label()
+    }
+
+    @MainActor
+    var roleDescription: String? {
+        self.element.roleDescription()
+    }
+
+    @MainActor
+    var identifier: String? {
+        self.element.identifier()
+    }
+
+    @MainActor
+    var role: String? {
+        self.element.role()
+    }
+
+    @MainActor
+    var subrole: String? {
+        self.element.subrole()
+    }
+
+    @MainActor
+    var frame: CGRect? {
+        self.element.frame()
+    }
+
+    @MainActor
+    var value: Any? {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(
+            self.element.underlyingElement,
+            AXAttributeNames.kAXValueAttribute as CFString,
+            &value)
+        return error == .success ? value : nil
+    }
+
+    @MainActor
+    var stringValue: String? {
+        self.value as? String
+    }
+
+    @MainActor
+    var actionNames: [String] {
+        self.element.supportedActions() ?? []
+    }
+
+    @MainActor
+    var isValueSettable: Bool {
+        self.element.isAttributeSettable(named: AXAttributeNames.kAXValueAttribute)
+    }
+
+    @MainActor
+    var isFocusedSettable: Bool {
+        self.element.isAttributeSettable(named: AXAttributeNames.kAXFocusedAttribute)
+    }
+
+    @MainActor
+    var isSelectedSettable: Bool {
+        self.element.isAttributeSettable(named: kAXSelectedAttribute as String)
+    }
+
+    @MainActor
+    var selectedValue: Bool? {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(
+            self.element.underlyingElement,
+            kAXSelectedAttribute as CFString,
+            &value)
+        guard error == .success, let value else { return nil }
+        return value as? Bool
+    }
+
+    @MainActor
+    var isEnabled: Bool {
+        self.element.isEnabled() ?? true
+    }
+
+    @MainActor
+    var isFocused: Bool {
+        self.element.isFocused() ?? false
+    }
+
+    @MainActor
+    var focusedState: Bool? {
+        self.element.isFocused()
+    }
+
+    @MainActor
+    var isOffscreen: Bool {
+        guard let frame else { return false }
+        let appKitFrame = GlobalScreenCoordinateGeometry.appKitRect(
+            fromGlobalDisplay: frame,
+            primaryScreenFrame: NSScreen.screens.first?.frame)
+        let visibleFrame = NSScreen.screens
+            .map(\.visibleFrame)
+            .reduce(CGRect.null) { partial, screenFrame in
+                partial.isNull ? screenFrame : partial.union(screenFrame)
+            }
+        guard !visibleFrame.isNull else { return false }
+        return appKitFrame.intersection(visibleFrame).isNull
+    }
+
+    @MainActor
+    var parent: AutomationElement? {
+        self.element.parent().map(AutomationElement.init)
+    }
+
+    @MainActor
+    var children: [AutomationElement] {
+        (self.element.children() ?? []).map(AutomationElement.init)
+    }
+
+    @MainActor
+    var anchorPoint: CGPoint? {
+        self.frame.map { CGPoint(x: $0.midX, y: $0.midY) }
+    }
+
+    @MainActor
+    var automationChildren: [any AutomationElementRepresenting] {
+        self.children
+    }
+
+    @MainActor
+    var underlyingAXElement: AXUIElement? {
+        self.element.underlyingElement
+    }
+
+    @MainActor
+    var focusedElementIdentity: FocusedElementIdentity? {
+        var processIdentifier: pid_t = 0
+        guard AXUIElementGetPid(self.element.underlyingElement, &processIdentifier) == .success,
+              processIdentifier > 0,
+              let windowID = AXWindowIDResolver.owningWindowID(of: self.element.underlyingElement).map(Int.init),
+              windowID > 0,
+              let role = self.role,
+              let frame = self.frame,
+              !frame.isEmpty
+        else {
+            return nil
+        }
+        return FocusedElementIdentity(
+            processIdentifier: processIdentifier,
+            windowID: windowID,
+            role: role,
+            title: self.stringAttribute(AXAttributeNames.kAXTitleAttribute),
+            identifier: self.identifier,
+            frame: frame)
+    }
+
+    @MainActor
+    func supportsAction(_ actionName: String) -> Bool {
+        // Query the dedicated actions API. AXorcist's `supportedActions()` reads the `AXActionNames`
+        // attribute via `AXUIElementCopyAttributeValue`, which returns `attributeUnsupported` for
+        // many elements (e.g. SwiftUI buttons) even when `AXUIElementCopyActionNames` reports the
+        // action. Falling back to `actionNames` preserves behavior if the actions API itself fails.
+        var actionNames: CFArray?
+        let error = AXUIElementCopyActionNames(self.element.underlyingElement, &actionNames)
+        guard error == .success, let names = actionNames as? [String] else {
+            return self.actionNames.contains(actionName)
+        }
+        return names.contains(actionName)
+    }
+
+    @MainActor
+    func performAutomationAction(_ actionName: String) throws {
+        _ = try self.element.performAction(actionName)
+    }
+
+    @MainActor
+    func setAutomationValue(_ value: UIElementValue) throws {
+        let error = AXUIElementSetAttributeValue(
+            self.element.underlyingElement,
+            AXAttributeNames.kAXValueAttribute as CFString,
+            value.accessibilityValue as CFTypeRef)
+        guard error == .success else {
+            throw AccessibilitySystemError(error)
+        }
+    }
+
+    @MainActor
+    func setAutomationFocused(_ focused: Bool) throws {
+        let error = AXUIElementSetAttributeValue(
+            self.element.underlyingElement,
+            AXAttributeNames.kAXFocusedAttribute as CFString,
+            (focused ? kCFBooleanTrue : kCFBooleanFalse) as CFTypeRef)
+        guard error == .success else {
+            throw AccessibilitySystemError(error)
+        }
+    }
+
+    @MainActor
+    func setAutomationSelected(_ selected: Bool) throws {
+        let error = AXUIElementSetAttributeValue(
+            self.element.underlyingElement,
+            kAXSelectedAttribute as CFString,
+            (selected ? kCFBooleanTrue : kCFBooleanFalse) as CFTypeRef)
+        guard error == .success else {
+            throw AccessibilitySystemError(error)
+        }
+    }
+
+    @MainActor
+    func stringAttribute(_ name: String) -> String? {
+        self.element.attribute(Attribute<String>(name))
+    }
+
+    @MainActor
+    func intAttribute(_ name: String) -> Int? {
+        self.element.attribute(Attribute<Int>(name))
+    }
+
+    @MainActor
+    func doubleAttribute(_ name: String) -> Double? {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(
+            self.element.underlyingElement,
+            name as CFString,
+            &value)
+        guard error == .success,
+              let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else {
+            return nil
+        }
+        return number.doubleValue
+    }
+}

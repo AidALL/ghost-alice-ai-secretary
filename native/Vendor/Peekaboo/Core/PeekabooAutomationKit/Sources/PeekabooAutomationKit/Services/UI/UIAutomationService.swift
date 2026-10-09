@@ -1,0 +1,305 @@
+import Foundation
+import os.log
+import PeekabooFoundation
+
+@MainActor
+struct HotkeyServiceFactoryContext {
+    let desktopOperationExecutor: DesktopOperationExecutor
+    let operationFinalizer: @MainActor () -> Void
+    let processStartIdentityProvider: @Sendable (pid_t) -> UInt64?
+}
+
+/**
+ * Primary UI automation service orchestrating specialized automation components.
+ *
+ * Provides unified interface for UI interactions including element detection, clicking, typing,
+ * scrolling, and gestures. Delegates to specialized services while managing snapshots and
+ * providing visual feedback integration.
+ *
+ * ## Core Operations
+ * - Element detection using AI-powered recognition
+ * - Click, type, scroll, hotkey, and gesture operations
+ * - Snapshot management for stateful automation workflows
+ * - Visual feedback via PeekabooVisualizer integration
+ *
+ * ## Usage Example
+ * ```swift
+ * let automation = UIAutomationService()
+ *
+ * // Detect elements in screenshot
+ * let elements = try await automation.detectElements(
+ *     in: imageData,
+ *     snapshotId: "ps1_0123456789abcdef0123456789abcdef",
+ *     windowContext: windowContext
+ * )
+ *
+ * // Perform automation
+ * try await automation.click(
+ *     target: .elementId(button.id),
+ *     clickType: .single,
+ *     snapshotId: "ps1_0123456789abcdef0123456789abcdef")
+ * try await automation.type(
+ *     text: "Hello World",
+ *     target: textField.id,
+ *     clearExisting: true,
+ *     snapshotId: "ps1_0123456789abcdef0123456789abcdef")
+ * ```
+ *
+ * - Important: Requires Screen Recording and Accessibility permissions
+ * - Note: All operations run on MainActor, performance varies 10-800ms by operation
+ * - Since: PeekabooCore 1.0.0
+ */
+@MainActor
+public final class UIAutomationService: TargetedHotkeyServiceProtocol, TargetedTypeServiceProtocol,
+    ExactWindowTargetedClickServiceProtocol, TargetedFocusedElementServiceProtocol,
+    ExactWindowTargetedKeyboardServiceProtocol, ExactWindowFocusedElementServiceProtocol,
+    ExactWindowPixelFocusTypingServiceProtocol,
+    ForegroundModifierClickServiceProtocol,
+    UIAutomationActionOutcomeProviding, UIAutomationGlobalPointerActionResultProviding
+{
+    public let supportsProcessGenerationPinnedHotkeys = true
+    public let supportsProcessGenerationPinnedTypeActions = true
+    public let supportsProcessGenerationPinnedClicks = true
+    public let supportsStatelessClickVariants = true
+    public let supportsTargetedClickAccessibilityValueDelivery = true
+    public let supportsExactWindowTargetedKeyboard = true
+    public let supportsExactWindowCompositeTypeDelivery = true
+    public let supportsExactWindowFocusedElementFocus = true
+    public let supportsExactWindowPixelFocusTyping = true
+    public let supportsForegroundModifierClick = true
+    public let supportsForegroundModifierClickSnapshotLease = true
+    public let supportsRequestPinnedExactWindowScrollReceipt = true
+    public let exactWindowTargetedKeyboardUnavailableReason: String? = nil
+    public let exactWindowCompositeTypeDeliveryUnavailableReason: String? = nil
+    public let exactWindowPixelFocusTypingUnavailableReason: String? = nil
+    public let foregroundModifierClickUnavailableReason: String? = nil
+    let logger = Logger(subsystem: "boo.peekaboo.core", category: "UIAutomationService")
+    let snapshotManager: any SnapshotManagerProtocol
+
+    // Specialized services
+    let elementDetectionService: ElementDetectionService
+    let clickService: ClickService
+    let typeService: TypeService
+    let scrollService: ScrollService
+    let hotkeyService: HotkeyService
+    let gestureService: GestureService
+    let screenCaptureService: ScreenCaptureService
+
+    let feedbackClient: any AutomationFeedbackClient
+    public let inputPolicy: UIInputPolicy
+    let actionInputDriver: any ActionInputDriving
+    let syntheticInputDriver: any SyntheticInputDriving
+    let automationElementResolver: any AutomationElementResolving
+    let elementMutationValueReader: @MainActor @Sendable (AutomationElement) -> String?
+    let exactWindowFocusReader: @Sendable (pid_t) -> ExactWindowFocusSnapshot?
+    let exactFocusedElementReader: @Sendable (FocusedElementIdentity)
+        -> Result<ExactWindowFocusSnapshot, FocusedElementReceiptError>
+    let continuationFocusedElementReader: @Sendable (FocusedElementIdentity)
+        -> Result<ExactWindowFocusSnapshot, FocusedElementReceiptError>
+    let exactFocusedElementValueReader: @Sendable (FocusedElementIdentity)
+        -> Result<ExactWindowFocusSnapshot, FocusedElementReceiptError>
+    let exactKeyWindowReader: @Sendable (pid_t) -> ExactKeyWindowSnapshot?
+    let exactWindowIdentityValidator: @Sendable (WindowMutationIdentity, CGRect) -> Bool
+    let processStartIdentityProvider: @Sendable (pid_t) -> UInt64?
+    let operationLaneCoordinator: DesktopOperationLaneCoordinator
+    let desktopOperationExecutor: DesktopOperationExecutor
+    let heldPointerLifecycle: ExactWindowHeldPointerLifecycle
+
+    // Search constraints to prevent unbounded AX traversals
+    var searchLimits: UIAutomationSearchLimits
+    public private(set) var searchPolicy: SearchPolicy
+
+    /**
+     * Initialize the UI automation service with optional dependency injection.
+     *
+     * Creates a new automation service instance with all specialized services properly configured.
+     * The service automatically detects its runtime environment and configures visualizer integration
+     * appropriately (disabled when running inside the Mac app, enabled for CLI tools).
+     *
+     * - Parameters:
+     *   - snapshotManager: Snapshot manager for state tracking (creates default if nil)
+     *   - loggingService: Logging service for debug output (creates default if nil)
+     *
+     * ## Service Initialization
+     * The constructor initializes these specialized services:
+     * - `ElementDetectionService` with AX traversal collaborators
+     * - `ClickService` for precise mouse interactions
+     * - `TypeService` for intelligent text input (note: clickService parameter is nil to avoid circular dependency)
+     * - `ScrollService` for smooth scrolling operations
+     * - `HotkeyService` for system-level keyboard shortcuts
+     * - `GestureService` for complex mouse gestures and drag operations
+     * - `ScreenCaptureService` with logging integration
+     *
+     * ## Visualizer Integration
+     * Automatically connects to PeekabooVisualizer for real-time feedback unless running
+     * inside the Mac app (bundle ID: "boo.peekaboo.mac"). This prevents the Mac app from
+     * trying to connect to itself as a visualizer client.
+     *
+     * ## Example
+     * ```swift
+     * // Default initialization
+     * let automation = UIAutomationService()
+     *
+     * // With custom snapshot manager
+     * let customSnapshot = SnapshotManager()
+     * let automation = UIAutomationService(snapshotManager: customSnapshot)
+     * ```
+     *
+     * - Important: All services are initialized on the main thread due to UI automation requirements
+     * - Note: The visualizer connection is established asynchronously and failures are logged but not thrown
+     */
+    public convenience init(
+        snapshotManager: (any SnapshotManagerProtocol)? = nil,
+        loggingService: (any LoggingServiceProtocol)? = nil,
+        searchPolicy: SearchPolicy = .balanced,
+        inputPolicy: UIInputPolicy = .currentBehavior,
+        feedbackClient: any AutomationFeedbackClient = NoopAutomationFeedbackClient(),
+        operationLaneCoordinator: DesktopOperationLaneCoordinator = .shared)
+    {
+        self.init(
+            snapshotManager: snapshotManager,
+            loggingService: loggingService,
+            searchPolicy: searchPolicy,
+            inputPolicy: inputPolicy,
+            actionInputDriver: ActionInputDriver(),
+            syntheticInputDriver: SyntheticInputDriver(),
+            automationElementResolver: AutomationElementResolver(),
+            feedbackClient: feedbackClient,
+            operationLaneCoordinator: operationLaneCoordinator)
+    }
+
+    init(
+        snapshotManager: (any SnapshotManagerProtocol)? = nil,
+        loggingService: (any LoggingServiceProtocol)? = nil,
+        searchPolicy: SearchPolicy = .balanced,
+        inputPolicy: UIInputPolicy = .currentBehavior,
+        actionInputDriver: any ActionInputDriving,
+        syntheticInputDriver: any SyntheticInputDriving = SyntheticInputDriver(),
+        automationElementResolver: any AutomationElementResolving,
+        elementMutationValueReader: (@MainActor @Sendable (AutomationElement) -> String?)? = nil,
+        hotkeyServiceFactory: ((HotkeyServiceFactoryContext) -> HotkeyService)? = nil,
+        feedbackClient: any AutomationFeedbackClient = NoopAutomationFeedbackClient(),
+        exactWindowFocusReader: @escaping @Sendable (pid_t) -> ExactWindowFocusSnapshot? =
+            DetachedExactWindowFocusReader.read,
+        exactFocusedElementReader: @escaping @Sendable (FocusedElementIdentity)
+            -> Result<ExactWindowFocusSnapshot, FocusedElementReceiptError> =
+            DetachedExactWindowFocusReader.read,
+        continuationFocusedElementReader: @escaping @Sendable (FocusedElementIdentity)
+            -> Result<ExactWindowFocusSnapshot, FocusedElementReceiptError> =
+            DetachedExactWindowFocusReader.readContinuation,
+        exactFocusedElementValueReader: @escaping @Sendable (FocusedElementIdentity)
+            -> Result<ExactWindowFocusSnapshot, FocusedElementReceiptError> =
+            DetachedExactWindowFocusReader.readValue,
+        exactKeyWindowReader: @escaping @Sendable (pid_t) -> ExactKeyWindowSnapshot? =
+            DetachedExactWindowFocusReader.readKeyWindow,
+        exactWindowIdentityValidator: @escaping @Sendable (WindowMutationIdentity, CGRect) -> Bool =
+            SystemIdentityResolver.validateWindowMutationIdentity,
+        processStartIdentityProvider: @escaping @Sendable (pid_t) -> UInt64? =
+            SystemIdentityResolver.processStartIdentity,
+        operationLaneCoordinator: DesktopOperationLaneCoordinator = .shared,
+        desktopOperationExecutor: DesktopOperationExecutor? = nil)
+    {
+        let manager = snapshotManager ?? SnapshotManager()
+        self.snapshotManager = manager
+
+        let logger = loggingService ?? LoggingService()
+
+        self.searchPolicy = searchPolicy
+        self.searchLimits = UIAutomationSearchLimits.from(policy: searchPolicy)
+        self.inputPolicy = inputPolicy
+        self.actionInputDriver = actionInputDriver
+        self.syntheticInputDriver = syntheticInputDriver
+        self.automationElementResolver = automationElementResolver
+        self.elementMutationValueReader = elementMutationValueReader ?? { element in
+            Self.safeValueDescription(element.value)
+                ?? element.selectedValue.map(String.init)
+        }
+        self.feedbackClient = feedbackClient
+        self.exactWindowFocusReader = exactWindowFocusReader
+        self.exactFocusedElementReader = exactFocusedElementReader
+        self.continuationFocusedElementReader = continuationFocusedElementReader
+        self.exactFocusedElementValueReader = exactFocusedElementValueReader
+        self.exactKeyWindowReader = exactKeyWindowReader
+        self.exactWindowIdentityValidator = exactWindowIdentityValidator
+        self.processStartIdentityProvider = processStartIdentityProvider
+        self.operationLaneCoordinator = operationLaneCoordinator
+        let executor = desktopOperationExecutor ?? DesktopOperationExecutor(laneCoordinator: operationLaneCoordinator)
+        self.desktopOperationExecutor = executor
+        self.heldPointerLifecycle = ExactWindowHeldPointerLifecycle(
+            laneCoordinator: operationLaneCoordinator,
+            processStartIdentityProvider: processStartIdentityProvider)
+
+        // Initialize specialized services
+        let elementDetectionService = ElementDetectionService(snapshotManager: manager)
+        self.elementDetectionService = elementDetectionService
+        let operationFinalizer: @MainActor () -> Void = {
+            elementDetectionService.invalidateCache()
+        }
+        self.clickService = ClickService(
+            snapshotManager: manager,
+            inputPolicy: inputPolicy,
+            actionInputDriver: actionInputDriver,
+            syntheticInputDriver: syntheticInputDriver,
+            automationElementResolver: automationElementResolver,
+            exactWindowIdentityValidator: exactWindowIdentityValidator,
+            processStartIdentityProvider: processStartIdentityProvider,
+            desktopOperationExecutor: executor,
+            operationFinalizer: operationFinalizer)
+        self.typeService = TypeService(
+            snapshotManager: manager,
+            clickService: nil,
+            inputPolicy: inputPolicy,
+            actionInputDriver: actionInputDriver,
+            syntheticInputDriver: syntheticInputDriver,
+            automationElementResolver: automationElementResolver,
+            exactFocusedElementValueReader: exactFocusedElementValueReader,
+            processStartIdentityProvider: processStartIdentityProvider,
+            desktopOperationExecutor: executor,
+            operationFinalizer: operationFinalizer)
+        self.scrollService = ScrollService(
+            snapshotManager: manager,
+            clickService: nil,
+            inputPolicy: inputPolicy,
+            actionInputDriver: actionInputDriver,
+            syntheticInputDriver: syntheticInputDriver,
+            automationElementResolver: automationElementResolver,
+            exactWindowIdentityValidator: exactWindowIdentityValidator,
+            processStartIdentityProvider: processStartIdentityProvider,
+            desktopOperationExecutor: executor,
+            operationFinalizer: operationFinalizer)
+        if let hotkeyServiceFactory {
+            self.hotkeyService = hotkeyServiceFactory(HotkeyServiceFactoryContext(
+                desktopOperationExecutor: executor,
+                operationFinalizer: operationFinalizer,
+                processStartIdentityProvider: processStartIdentityProvider))
+        } else {
+            self.hotkeyService = HotkeyService(
+                inputPolicy: inputPolicy,
+                actionInputDriver: actionInputDriver,
+                processStartIdentityProvider: processStartIdentityProvider,
+                desktopOperationExecutor: executor,
+                operationFinalizer: operationFinalizer)
+        }
+        self.gestureService = GestureService()
+        let baseCaptureDeps = ScreenCaptureService.Dependencies.live()
+        let captureDeps = ScreenCaptureService.Dependencies(
+            feedbackClient: feedbackClient,
+            permissionEvaluator: baseCaptureDeps.permissionEvaluator,
+            fallbackRunner: baseCaptureDeps.fallbackRunner,
+            applicationResolver: baseCaptureDeps.applicationResolver,
+            makeFrameSource: baseCaptureDeps.makeFrameSource,
+            makeModernOperator: baseCaptureDeps.makeModernOperator,
+            makeLegacyOperator: baseCaptureDeps.makeLegacyOperator,
+            screenLockProbe: baseCaptureDeps.screenLockProbe)
+        self.screenCaptureService = ScreenCaptureService(loggingService: logger, dependencies: captureDeps)
+
+        // Connect to visual feedback if available.
+        let isMacApp = Bundle.main.bundleIdentifier?.hasPrefix("boo.peekaboo.mac") == true
+        if !isMacApp {
+            self.logger.debug("Connecting to visualizer service (running as CLI/external tool)")
+            self.feedbackClient.connect()
+        } else {
+            self.logger.debug("Skipping visualizer connection (running inside Mac app)")
+        }
+    }
+}

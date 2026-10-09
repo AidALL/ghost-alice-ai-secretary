@@ -1,0 +1,681 @@
+import Foundation
+import PeekabooAutomationKit
+import PeekabooFoundation
+
+private struct OperationReceiptEncodingContext {
+    let request: PeekabooBridgeRequest
+    let plan: PeekabooBridgeOperationResultSemantics.PeekabooBridgeRequestPlan
+    let requestPayload: PeekabooBridgeAttestedOperationRequest
+    let authority: PeekabooBridgeOperationReceiptAuthority
+    let claim: PeekabooBridgeOperationSessionClaim
+    let startedAt: Int64
+}
+
+private struct OperationReceiptTargetState {
+    let target: PeekabooBridgeOperationTargetReceipt?
+    let focusedElement: FocusedElementIdentity?
+    let failure: PeekabooBridgeTargetAttributionFailure?
+    let failureEvidence: [PeekabooBridgeOperationTargetEvidence]?
+}
+
+private enum OperationReceiptRequestCarriage {
+    case valid(PeekabooBridgeRequest)
+    case invalidProjected(any Error)
+}
+
+@MainActor
+extension PeekabooBridgeServer {
+    func handleAttestedOperation(
+        _ payload: PeekabooBridgeAttestedOperationRequest,
+        peer: PeekabooBridgePeer?,
+        admissionRefused: Bool = false) async throws -> Data
+    {
+        var operationMayHaveCompleted = false
+        do {
+            return try await self.performAttestedOperation(
+                payload,
+                peer: peer,
+                admissionRefused: admissionRefused,
+                operationMayHaveCompleted: &operationMayHaveCompleted)
+        } catch let envelope as PeekabooBridgeErrorEnvelope {
+            throw envelope
+        } catch {
+            let operation = payload.request.operation.rawValue
+            let reason = error.localizedDescription
+            self.logger.error(
+                """
+                bridge op=\(operation, privacy: .public) could not produce a signed receipt: \(reason, privacy: .public)
+                """)
+            throw PeekabooBridgeErrorEnvelope(
+                code: .internalError,
+                message: "Bridge host could not produce a signed receipt for \(operation): \(reason)",
+                details: reason,
+                operationMayHaveCompleted: operationMayHaveCompleted)
+        }
+    }
+
+    // Attested execution deliberately keeps claim, target, signing, and handoff reservation cleanup in one scope.
+    // swiftlint:disable:next function_body_length
+    private func performAttestedOperation(
+        _ payload: PeekabooBridgeAttestedOperationRequest,
+        peer: PeekabooBridgePeer?,
+        admissionRefused: Bool,
+        operationMayHaveCompleted: inout Bool) async throws -> Data
+    {
+        guard let authority = PeekabooBridgeRequestContext.operationReceiptAuthority else {
+            throw PeekabooBridgeErrorEnvelope(
+                code: .operationNotSupported,
+                message: "This Bridge listener does not support attested operation receipts")
+        }
+        guard let peer else {
+            throw PeekabooBridgeErrorEnvelope(
+                code: .unauthorizedClient,
+                message: "Attested Bridge operations require an authenticated socket peer")
+        }
+        let requestCarriage = try Self.validateOperationReceiptRequestCarriage(payload)
+        let claim: PeekabooBridgeOperationSessionClaim
+        do {
+            switch try await authority.claim(payload, peer: peer) {
+            case let .accepted(acceptedClaim):
+                claim = acceptedClaim
+            case let .rolloverRequired(refusal):
+                return try self.encoder.encode(PeekabooBridgeResponse.operationSessionRollover(refusal))
+            }
+        } catch let error as PeekabooBridgeOperationReceiptError {
+            let code = Self.operationReceiptClaimErrorCode(error)
+            throw PeekabooBridgeErrorEnvelope(code: code, message: error.localizedDescription)
+        }
+        defer { authority.complete(claim) }
+
+        let startedAt = PeekabooBridgeOperationReceiptCoding.unixMilliseconds()
+        let request: PeekabooBridgeRequest
+        switch requestCarriage {
+        case let .valid(validatedRequest):
+            request = validatedRequest
+        case let .invalidProjected(error):
+            return try await self.encodeInvalidAttestedRequestCarriage(
+                error: error,
+                payload: payload,
+                authority: authority,
+                claim: claim,
+                startedAt: startedAt)
+        }
+        let handoffReservationID = Self.browserHandoffReservationID(
+            request: request,
+            requestID: payload.requestID)
+        defer {
+            self.abandonBrowserHandoffReservation(handoffReservationID)
+        }
+        let encodingContext = OperationReceiptEncodingContext(
+            request: request,
+            plan: PeekabooBridgeOperationResultSemantics.requestPlan(for: request, vocabulary: .current),
+            requestPayload: payload,
+            authority: authority,
+            claim: claim,
+            startedAt: startedAt)
+        let plan = encodingContext.plan
+        let requestEvidence = plan.target.requestEvidence
+        if let compatibilityRefusal = try await self.exactScrollCompatibilityRefusal(request, claim, encodingContext) {
+            return compatibilityRefusal
+        }
+        let requestTarget: DesktopTargetIdentity?
+        do {
+            requestTarget = try PeekabooBridgeOperationTargetAttribution.resolveRequest(plan)
+        } catch let error as DesktopTargetIdentityError {
+            let failure = PeekabooBridgeTargetAttributionFailure(error, stage: .preDispatch)
+            let response = Self.targetAttributionFailureResponse(
+                plan: plan,
+                failure: failure,
+                originalOutcome: nil,
+                afterExecution: false)
+            return try await self.encodeAttestedResponse(
+                response,
+                targetState: .init(
+                    target: nil,
+                    focusedElement: nil,
+                    failure: failure,
+                    failureEvidence: requestEvidence.map(PeekabooBridgeOperationTargetEvidence.init)),
+                context: encodingContext)
+        }
+        if admissionRefused {
+            let response = try PeekabooBridgeRequestContext.$usesAttestedOperationResultSemantics
+                .withValue(true) {
+                    try Self.admissionRefusalResponse(for: request)
+                }
+            guard PeekabooBridgeOperationReceiptSemantics.allowsTargetlessFailureReceipt(for: response) else {
+                throw PeekabooBridgeErrorEnvelope(
+                    code: .internalError,
+                    message: "Bridge admission refusal did not produce canonical no-dispatch semantics")
+            }
+            return try await self.encodeAttestedResponse(
+                response,
+                targetState: .init(
+                    target: nil,
+                    focusedElement: nil,
+                    failure: nil,
+                    failureEvidence: nil),
+                context: encodingContext)
+        }
+
+        let handled = await self.executeAttestedOperation(plan: plan, claim: claim, peer: peer)
+        operationMayHaveCompleted = plan.result.completion.mutatesDesktop &&
+            !PeekabooBridgeOperationResultSemantics.isNoDispatchFailure(handled.response)
+        let response: PeekabooBridgeResponse
+        let target: PeekabooBridgeOperationTargetReceipt?
+        let focusedElement: FocusedElementIdentity?
+        let targetFailure: PeekabooBridgeTargetAttributionFailure?
+        let targetFailureEvidence: [PeekabooBridgeOperationTargetEvidence]?
+        let attributionEvidence = PeekabooBridgeOperationTargetAttribution.evidence(
+            plan: plan,
+            response: handled.response,
+            handledTarget: handled.targetIdentity ?? requestTarget)
+        do {
+            try PeekabooBridgeOperationResultSemantics.validateSuccessfulTargetDisposition(
+                plan: plan,
+                handled: handled)
+            if PeekabooBridgeOperationReceiptSemantics.allowsTargetlessFailureReceipt(for: handled.response) {
+                response = handled.response
+                target = nil
+                focusedElement = nil
+            } else if let browserReceipt = handled.externalBrowserTarget,
+                      !PeekabooBridgeOperationResultSemantics.isNoDispatchFailure(handled.response)
+            {
+                guard browserReceipt.isCanonicalExternalTarget,
+                      handled.response.browserExecutionConnectionReceipt == browserReceipt
+                else {
+                    throw DesktopTargetIdentityError.incompleteExactWindow
+                }
+                response = handled.response
+                target = .browser(browserReceipt)
+                focusedElement = nil
+            } else {
+                let resolved = try PeekabooBridgeOperationTargetAttribution.resolve(
+                    plan: plan,
+                    response: handled.response,
+                    handledTarget: handled.targetIdentity ?? requestTarget)
+                let receiptTarget = PeekabooBridgeResolvedOperationTarget(resolved)
+                response = handled.response
+                target = receiptTarget.target
+                focusedElement = receiptTarget.focusedElement
+            }
+            targetFailure = nil
+            targetFailureEvidence = nil
+        } catch let error as DesktopTargetIdentityError {
+            let failure = PeekabooBridgeTargetAttributionFailure(error, stage: .postExecution)
+            response = Self.targetAttributionFailureResponse(
+                plan: plan,
+                failure: failure,
+                originalOutcome: handled.outcome?.projection ??
+                    PeekabooBridgeOperationReceiptSemantics.outcome(in: handled.response),
+                originalFailure: PeekabooBridgeOperationResultSemantics.actionFailure(in: handled.response),
+                afterExecution: true)
+            target = nil
+            focusedElement = nil
+            targetFailure = failure
+            targetFailureEvidence = attributionEvidence.map(PeekabooBridgeOperationTargetEvidence.init)
+        }
+        return try await self.encodeAttestedResponse(
+            response,
+            targetState: .init(
+                target: target,
+                focusedElement: focusedElement,
+                failure: targetFailure,
+                failureEvidence: targetFailureEvidence),
+            selectedLeafEvidence: targetFailure == nil ? handled.selectedLeafEvidence : nil,
+            context: encodingContext)
+    }
+
+    private func exactScrollCompatibilityRefusal(
+        _ request: PeekabooBridgeRequest,
+        _ claim: PeekabooBridgeOperationSessionClaim,
+        _ context: OperationReceiptEncodingContext) async throws -> Data?
+    {
+        guard request.requiresRequestPinnedExactWindowScrollReceipt,
+              !claim.negotiatedCapabilities.requestPinnedExactWindowScrollReceipt
+        else { return nil }
+        return try await self.encodeAttestedResponse(
+            Self.requestPinnedExactWindowScrollRuntimeRefusal(plan: context.plan),
+            targetState: .init(
+                target: nil,
+                focusedElement: nil,
+                failure: nil,
+                failureEvidence: nil),
+            context: context)
+    }
+
+    private func executeAttestedOperation(
+        plan: PeekabooBridgeOperationResultSemantics.PeekabooBridgeRequestPlan,
+        claim: PeekabooBridgeOperationSessionClaim,
+        peer: PeekabooBridgePeer) async -> PeekabooBridgeHandledResponse
+    {
+        if plan.request.requiresCompositeTypeDeliverySupport,
+           !claim.negotiatedCapabilities.compositeTypeDelivery
+        {
+            return Self.compositeTypeDeliveryRefusal(plan: plan)
+        }
+        let operationContext = PeekabooBridgeBrowserHandoffOperationContext(
+            requestID: claim.requestID,
+            clientInstanceID: claim.sessionAttestation.clientInstanceID,
+            peer: peer)
+        let handled = await PeekabooBridgeRequestContext.$negotiatedSessionCapabilities.withValue(
+            claim.negotiatedCapabilities)
+        {
+            await PeekabooBridgeRequestContext.$browserHandoffOperation.withValue(operationContext) {
+                await PeekabooBridgeRequestContext.$usesAttestedOperationResultSemantics.withValue(true) {
+                    await self.terminalResponse(for: plan, peer: peer)
+                }
+            }
+        }
+        // This is the single enrichment boundary for attested read-only errors. Existing precise
+        // envelopes pass through unchanged; only metadata-less targetless failures are normalized.
+        return Self.normalizingTargetlessReadOnlyFailure(handled, plan: plan)
+    }
+
+    private static func compositeTypeDeliveryRefusal(
+        plan: PeekabooBridgeOperationResultSemantics.PeekabooBridgeRequestPlan) -> PeekabooBridgeHandledResponse
+    {
+        let failure = DesktopActionFailure.preDispatchRefusal(
+            route: .bridge,
+            reason: .runtimeIncompatible,
+            message: "This Bridge session cannot return truthful composite background typing receipts.",
+            hint: "Update and relaunch Peekaboo before retrying background clear-and-type input.")
+        let envelope = PeekabooBridgeErrorEnvelope(
+            code: .operationNotSupported,
+            actionFailure: failure,
+            details: "Bridge protocol 1.36 composite type delivery was not negotiated.")
+        if case .projectedAction = plan.carriageRequest {
+            return self.projectedFailure(envelope, mayMutateDesktop: true)
+        }
+        return .init(response: .error(envelope))
+    }
+
+    static func operationReceiptClaimErrorCode(
+        _ error: PeekabooBridgeOperationReceiptError) -> PeekabooBridgeErrorCode
+    {
+        switch error {
+        case .replayedRequest, .listenerInstanceMismatch, .clientIdentityMismatch:
+            .invalidRequest
+        case .operationSessionRegistryExhausted, .archiveWriteFailed,
+             .invalidOperationSessionConfiguration:
+            .serverBusy
+        default:
+            .unauthorizedClient
+        }
+    }
+
+    private func encodeAttestedResponse(
+        _ response: PeekabooBridgeResponse,
+        targetState: OperationReceiptTargetState,
+        selectedLeafEvidence: [DesktopSelectedLeafEvidence]? = nil,
+        context: OperationReceiptEncodingContext) async throws -> Data
+    {
+        // Shipped clients reconstruct the digest after decoding. Project unknown fields before hashing or signing.
+        let response = try response.projectingScreenCaptureKitDiagnostics(
+            offered: context.claim.negotiatedCapabilities.screenCaptureKitOwnershipDiagnostics)
+            .projectingSetValueVerification(
+                offered: context.claim.negotiatedCapabilities.setValueVerification, request: context.request)
+        let receiptPayload = try PeekabooBridgeOperationReceiptPayload(
+            requestID: context.requestPayload.requestID,
+            sessionID: context.requestPayload.sessionID,
+            sessionSequence: context.requestPayload.sessionSequence,
+            sessionAttestationSHA256: PeekabooBridgeOperationReceiptCoding.sha256(
+                context.claim.sessionAttestation),
+            listenerInstanceID: context.authority.attestation.listenerInstanceID,
+            listenerPublicKeySHA256: PeekabooBridgeOperationReceiptCoding.sha256(
+                context.authority.attestation.publicKey),
+            host: context.authority.attestation.host,
+            clientInstanceID: context.requestPayload.clientInstanceID,
+            client: context.requestPayload.client,
+            operation: context.request.operation,
+            requestSHA256: PeekabooBridgeOperationReceiptCoding.sha256(context.request),
+            responseSHA256: PeekabooBridgeOperationReceiptCoding.sha256(response),
+            target: targetState.target,
+            focusedElement: targetState.focusedElement,
+            targetAttributionFailure: targetState.failure,
+            targetAttributionEvidence: targetState.failureEvidence,
+            selectedLeafEvidence: selectedLeafEvidence,
+            outcome: PeekabooBridgeOperationReceiptSemantics.outcome(in: response),
+            remainingClaimCount: context.claim.remainingClaimCount,
+            startedAtUnixMilliseconds: context.startedAt,
+            completedAtUnixMilliseconds: max(
+                context.startedAt,
+                PeekabooBridgeOperationReceiptCoding.unixMilliseconds()))
+        try PeekabooBridgeOperationReceiptSemantics.validateReceiptCarriage(
+            receiptPayload,
+            plan: context.plan,
+            response: response)
+        let receipt = try await context.authority.signAndArchive(receiptPayload, claim: context.claim)
+        if case let .browserConnect(connectRequest) = context.request.unwrappedOperationRequest,
+           connectRequest.requestsHandoff,
+           let connectionReceipt = response.browserExecutionConnectionReceipt,
+           connectionReceipt.isCanonicalExecutionTarget
+        {
+            let bundle = try PeekabooBridgeOperationReceiptBundle(
+                operationAttestation: context.authority.attestation,
+                operationSessionAttestation: context.claim.sessionAttestation,
+                receipt: receipt,
+                canonicalListenerAttestationPayload: PeekabooBridgeOperationReceiptCoding.canonicalData(
+                    context.authority.attestation.unsignedPayload),
+                canonicalSessionAttestationPayload: PeekabooBridgeOperationReceiptCoding.canonicalData(
+                    context.claim.sessionAttestation.unsignedPayload),
+                canonicalReceiptPayload: PeekabooBridgeOperationReceiptCoding.canonicalData(receipt.payload),
+                canonicalRequest: PeekabooBridgeOperationReceiptCoding.canonicalData(context.request),
+                canonicalResponse: PeekabooBridgeOperationReceiptCoding.canonicalData(response))
+            try self.browserHandoffGrantRegistry.finalize(
+                requestID: context.requestPayload.requestID,
+                receiptBundle: bundle,
+                connectionReceipt: connectionReceipt)
+        }
+        return try self.encoder.encode(PeekabooBridgeResponse.attestedOperation(.init(
+            response: response,
+            receipt: receipt)))
+    }
+
+    private static func validateOperationReceiptRequestCarriage(
+        _ payload: PeekabooBridgeAttestedOperationRequest) throws -> OperationReceiptRequestCarriage
+    {
+        do {
+            return try .valid(payload.validatedRequest())
+        } catch {
+            guard case .projectedAction = payload.request else { throw error }
+            return .invalidProjected(error)
+        }
+    }
+
+    private func encodeInvalidAttestedRequestCarriage(
+        error: any Error,
+        payload: PeekabooBridgeAttestedOperationRequest,
+        authority: PeekabooBridgeOperationReceiptAuthority,
+        claim: PeekabooBridgeOperationSessionClaim,
+        startedAt: Int64) async throws -> Data
+    {
+        try await self.encodeAttestedResponse(
+            Self.invalidAttestedRequestCarriageResponse(error: error),
+            targetState: .init(
+                target: nil,
+                focusedElement: nil,
+                failure: nil,
+                failureEvidence: nil),
+            context: .init(
+                request: payload.request,
+                plan: PeekabooBridgeOperationResultSemantics.requestPlan(
+                    for: payload.request,
+                    vocabulary: .current),
+                requestPayload: payload,
+                authority: authority,
+                claim: claim,
+                startedAt: startedAt))
+    }
+
+    private static func invalidAttestedRequestCarriageResponse(error: any Error) -> PeekabooBridgeResponse {
+        let failure = DesktopActionFailure.preDispatchRefusal(
+            route: .bridge,
+            reason: .invalidRequest,
+            message: "Bridge operation request carriage is invalid.",
+            hint: "Rebuild the request with exactly one projected action wrapper.",
+            causeDescription: error.localizedDescription)
+        let envelope = PeekabooBridgeErrorEnvelope(
+            code: .invalidRequest,
+            actionFailure: failure,
+            details: error.localizedDescription)
+        return .projectedActionForCurrentRequestVocabulary(
+            response: .error(envelope),
+            outcome: failure.outcome.projection,
+            usesCurrentVocabulary: true)
+    }
+
+    private static func requestPinnedExactWindowScrollRuntimeRefusal(
+        plan: PeekabooBridgeOperationResultSemantics.PeekabooBridgeRequestPlan) -> PeekabooBridgeResponse
+    {
+        let envelope = self.requestPinnedExactWindowScrollRuntimeIncompatibleEnvelope()
+        guard let failure = envelope.desktopActionFailure else {
+            preconditionFailure("Exact-window scroll runtime refusal must carry a canonical action failure")
+        }
+        if case .projectedAction = plan.carriageRequest {
+            return .projectedActionForCurrentRequestVocabulary(
+                response: .error(envelope),
+                outcome: failure.outcome.projection,
+                usesCurrentVocabulary: true)
+        }
+        return .error(envelope)
+    }
+
+    static func requestPinnedExactWindowScrollRuntimeIncompatibleEnvelope() -> PeekabooBridgeErrorEnvelope {
+        let failure = DesktopActionFailure.preDispatchRefusal(
+            route: .bridge,
+            reason: .runtimeIncompatible,
+            message: "This Bridge session cannot preserve an exact-window scroll receipt.",
+            hint: "Update and relaunch Peekaboo before retrying background scroll.")
+        return PeekabooBridgeErrorEnvelope(
+            code: .versionMismatch,
+            actionFailure: failure,
+            context: "bridge_exact_scroll_receipt:runtime_incompatible")
+    }
+
+    private func terminalResponse(
+        for plan: PeekabooBridgeOperationResultSemantics.PeekabooBridgeRequestPlan,
+        peer: PeekabooBridgePeer) async -> PeekabooBridgeHandledResponse
+    {
+        let request = plan.carriageRequest
+        if case let .projectedAction(payload) = request {
+            do {
+                let nestedRequest = try payload.validatedRequest()
+                let nestedPlan = PeekabooBridgeOperationResultSemantics.requestPlan(
+                    for: nestedRequest,
+                    vocabulary: plan.vocabulary)
+                let handled = try await self.route(nestedPlan, peer: peer)
+                return .init(
+                    response: .projectedActionForCurrentRequestVocabulary(
+                        response: handled.response,
+                        outcome: handled.outcome?.routed(to: .bridge).projection),
+                    mutation: handled.mutation,
+                    targetIdentity: handled.targetIdentity,
+                    selectedLeafEvidence: handled.selectedLeafEvidence)
+            } catch let envelope as PeekabooBridgeErrorEnvelope {
+                return Self.projectedFailure(
+                    envelope,
+                    mayMutateDesktop: plan.result.completion.mutatesDesktop)
+            } catch let failure as DesktopActionFailure {
+                return Self.projectedFailure(
+                    .init(
+                        code: .internalError,
+                        actionFailure: failure.routed(to: .bridge),
+                        details: "\(failure)"),
+                    mayMutateDesktop: plan.result.completion.mutatesDesktop)
+            } catch is CancellationError {
+                return Self.projectedFailure(
+                    .init(
+                        code: .timeout,
+                        message: "Bridge request was cancelled"),
+                    mayMutateDesktop: plan.result.completion.mutatesDesktop)
+            } catch {
+                return Self.projectedFailure(
+                    .init(
+                        code: .internalError,
+                        message: error.localizedDescription,
+                        details: "\(error)"),
+                    mayMutateDesktop: plan.result.completion.mutatesDesktop)
+            }
+        }
+        do {
+            return try await self.route(plan, peer: peer)
+        } catch let envelope as PeekabooBridgeErrorEnvelope {
+            let responseEnvelope = PeekabooBridgeRequestContext.usesAttestedOperationResultSemantics
+                ? Self.canonicalMutationFailureEnvelope(
+                    envelope,
+                    mayMutateDesktop: plan.result.completion.mutatesDesktop)
+                : envelope.legacyCompatible
+            return .init(
+                response: .error(responseEnvelope),
+                selectedLeafEvidence: responseEnvelope.actionSelectedLeafEvidence)
+        } catch let failure as DesktopActionFailure
+            where PeekabooBridgeRequestContext.usesAttestedOperationResultSemantics
+        {
+            let routed = failure.routed(to: .bridge)
+            return .init(
+                response: .error(.init(
+                    code: .internalError,
+                    actionFailure: routed,
+                    details: "\(failure)")),
+                selectedLeafEvidence: routed.selectedLeafEvidence)
+        } catch is CancellationError {
+            return .init(response: .error(Self.canonicalMutationFailureEnvelope(
+                .init(code: .timeout, message: "Bridge request was cancelled"),
+                mayMutateDesktop: plan.result.completion.mutatesDesktop)))
+        } catch {
+            return .init(response: .error(Self.canonicalMutationFailureEnvelope(
+                .init(
+                    code: .internalError,
+                    message: error.localizedDescription,
+                    details: "\(error)"),
+                mayMutateDesktop: plan.result.completion.mutatesDesktop)))
+        }
+    }
+
+    private static func targetlessReadOnlyFailureEnvelope(
+        _ envelope: PeekabooBridgeErrorEnvelope,
+        plan: PeekabooBridgeOperationResultSemantics.PeekabooBridgeRequestPlan) -> PeekabooBridgeErrorEnvelope
+    {
+        guard !plan.result.completion.mutatesDesktop,
+              !envelope.operationMayHaveCompleted,
+              envelope.actionOutcome == nil,
+              envelope.actionTargetReceipt == nil,
+              envelope.actionSelectedLeafEvidence == nil
+        else {
+            return envelope
+        }
+        let failure = DesktopActionFailure.preDispatchRefusal(
+            route: .bridge,
+            reason: self.readOnlyFailureReason(envelope.code),
+            message: envelope.message,
+            hint: envelope.actionFailureHint,
+            causeDescription: envelope.details)
+        return PeekabooBridgeErrorEnvelope(
+            code: envelope.code,
+            actionFailure: failure.preservingScreenCaptureKitDiagnostic(envelope.screenCaptureKitOwnershipDiagnostic),
+            details: envelope.details,
+            permission: envelope.permission,
+            kind: envelope.kind,
+            context: envelope.context)
+    }
+
+    private static func normalizingTargetlessReadOnlyFailure(
+        _ handled: PeekabooBridgeHandledResponse,
+        plan: PeekabooBridgeOperationResultSemantics.PeekabooBridgeRequestPlan) -> PeekabooBridgeHandledResponse
+    {
+        guard case let .error(envelope) = handled.response else { return handled }
+        return handled.replacingResponse(.error(self.targetlessReadOnlyFailureEnvelope(envelope, plan: plan)))
+    }
+
+    private static func readOnlyFailureReason(
+        _ code: PeekabooBridgeErrorCode) -> DesktopActionOutcome.RefusalReason
+    {
+        switch code {
+        case .permissionDenied:
+            .permissionDenied
+        case .notFound:
+            .targetUnavailable
+        case .timeout:
+            .requestCancelled
+        case .invalidRequest, .decodingFailed:
+            .invalidRequest
+        case .operationNotSupported:
+            .operationUnsupported
+        case .serverBusy, .unauthorizedClient:
+            .transportSessionUnavailable
+        case .versionMismatch, .internalError:
+            .runtimeIncompatible
+        }
+    }
+
+    private static func projectedFailure(
+        _ unprojectedEnvelope: PeekabooBridgeErrorEnvelope,
+        mayMutateDesktop: Bool) -> PeekabooBridgeHandledResponse
+    {
+        let envelope = self.canonicalMutationFailureEnvelope(
+            unprojectedEnvelope,
+            mayMutateDesktop: mayMutateDesktop)
+        return .init(
+            response: .projectedActionForCurrentRequestVocabulary(
+                response: .error(envelope),
+                outcome: envelope.actionOutcome),
+            selectedLeafEvidence: envelope.actionSelectedLeafEvidence)
+    }
+
+    private static func canonicalMutationFailureEnvelope(
+        _ envelope: PeekabooBridgeErrorEnvelope,
+        mayMutateDesktop: Bool) -> PeekabooBridgeErrorEnvelope
+    {
+        guard mayMutateDesktop, envelope.actionOutcome == nil else { return envelope }
+        let failure = DesktopActionFailure.indeterminate(
+            route: .bridge,
+            evidence: .completionUnknown,
+            message: envelope.message,
+            hint: "Observe the intended target before retrying this operation.",
+            causeDescription: envelope.details)
+        return PeekabooBridgeErrorEnvelope(
+            code: envelope.code,
+            actionFailure: failure.preservingScreenCaptureKitDiagnostic(envelope.screenCaptureKitOwnershipDiagnostic),
+            details: envelope.details,
+            permission: envelope.permission,
+            kind: envelope.kind,
+            context: envelope.context)
+    }
+
+    private static func targetAttributionFailureResponse(
+        plan: PeekabooBridgeOperationResultSemantics.PeekabooBridgeRequestPlan,
+        failure: PeekabooBridgeTargetAttributionFailure,
+        originalOutcome: DesktopActionOutcome.Projection?,
+        originalFailure: DesktopActionFailure? = nil,
+        afterExecution: Bool) -> PeekabooBridgeResponse
+    {
+        let context = "bridge_target_attribution:\(failure.code.rawValue)"
+        guard plan.result.completion.mutatesDesktop else {
+            return .error(.init(
+                code: .invalidRequest,
+                message: "Bridge operation target attribution failed",
+                details: failure.message,
+                context: context))
+        }
+
+        let original = originalOutcome?.outcome
+        let mayHaveDispatched = afterExecution && (original?.dispatchState.mutationDispatched ?? true)
+        var diagnostics = [failure.message]
+        if let originalFailure {
+            // Preserve only caller-facing typed diagnostics, never raw envelope details or target evidence.
+            diagnostics.append("Original operation failure: \(originalFailure.message.prefix(512))")
+            if let cause = originalFailure.causeDescription, !cause.isEmpty {
+                diagnostics.append("Original cause: \(cause.prefix(1536))")
+            }
+        }
+        let causeDescription = diagnostics.joined(separator: "\n")
+        let actionFailure: DesktopActionFailure = if mayHaveDispatched {
+            .indeterminate(
+                route: .bridge,
+                delivery: original?.delivery,
+                evidence: .completionUnknown,
+                unitCount: original?.dispatchState.unitCount,
+                message: "Bridge operation completed without a trustworthy exact target receipt.",
+                hint: "Observe the intended target before any retry.",
+                causeDescription: causeDescription)
+        } else {
+            .preDispatchRefusal(
+                route: .bridge,
+                reason: .invalidRequest,
+                message: "Bridge operation was refused because its target receipt is invalid.",
+                hint: "Capture fresh target evidence and retry with one exact process or window receipt.",
+                causeDescription: causeDescription)
+        }
+        let envelope = PeekabooBridgeErrorEnvelope(
+            code: mayHaveDispatched ? .internalError : .invalidRequest,
+            actionFailure: actionFailure,
+            context: context)
+        if case .projectedAction = plan.carriageRequest {
+            return .projectedActionForCurrentRequestVocabulary(
+                response: .error(envelope),
+                outcome: actionFailure.outcome.projection,
+                usesCurrentVocabulary: true)
+        }
+        return .error(envelope)
+    }
+}
